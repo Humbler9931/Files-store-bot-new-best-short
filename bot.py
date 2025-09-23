@@ -4,18 +4,15 @@ import random
 import string
 import time
 import asyncio
-import json
-from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from pyrogram import Client, filters, enums
 from pyrogram.errors import UserNotParticipant, FloodWait
 from pyrogram.types import (
-    InlineKeyboardButton, InlineKeyboardMarkup, Message, CallbackQuery,
-    InputMediaPhoto, InputMediaDocument, InlineQueryResultArticle, InputTextMessageContent
+    InlineKeyboardButton, InlineKeyboardMarkup, Message, CallbackQuery
 )
 from pymongo import MongoClient
 from pymongo.errors import ConnectionFailure, DuplicateKeyError, InvalidOperation
-from flask import Flask, request, jsonify
+from flask import Flask
 from threading import Thread
 
 # --- Flask Web Server (To keep the bot alive) ---
@@ -24,12 +21,6 @@ flask_app = Flask(__name__)
 @flask_app.route('/')
 def index():
     return "Bot is alive!", 200
-
-@flask_app.route('/api/webhook', methods=['POST'])
-def webhook_receiver():
-    data = request.json
-    print(f"Received webhook data: {json.dumps(data, indent=2)}")
-    return jsonify({"status": "success"}), 200
 
 def run_flask():
     port = int(os.environ.get('PORT', 8080))
@@ -52,23 +43,18 @@ LOG_CHANNEL = int(os.environ.get("LOG_CHANNEL"))
 UPDATE_CHANNEL = os.environ.get("UPDATE_CHANNEL")
 ADMIN_IDS_STR = os.environ.get("ADMIN_IDS", "")
 ADMINS = [int(admin_id.strip()) for admin_id in ADMIN_IDS_STR.split(',') if admin_id]
-API_KEY = os.environ.get("API_KEY")
 
-# --- Global Dictionaries for temporary storage ---
-custom_caption_states = {}
-
-# --- Database Setup and Indexing ---
+# --- Database Setup ---
 try:
     client = MongoClient(MONGO_URI)
     db = client['file_link_bot']
     files_collection = db['files']
+    users_collection = db['users'] # New collection for user tracking
     settings_collection = db['settings']
-    users_collection = db['users']
     logging.info("Connected to MongoDB successfully!")
 
-    # **CRITICAL FIX:** Ensure indexes are created immediately after connection
+    # **ADVANCED FEATURE**: Create indexes for faster lookups and to prevent errors
     files_collection.create_index([("_id", 1)], unique=True)
-    files_collection.create_index([("expires_at", 1)], expireAfterSeconds=0)
     users_collection.create_index([("user_id", 1)], unique=True)
     logging.info("MongoDB indexes created/verified successfully!")
 
@@ -76,7 +62,7 @@ except ConnectionFailure as e:
     logging.error(f"Error connecting to MongoDB: {e}")
     exit()
 except InvalidOperation as e:
-    logging.error(f"MongoDB InvalidOperation error: {e}. This usually means an index was tried to be created after operations. The fix is to ensure `create_index` is called immediately after connection.")
+    logging.error(f"MongoDB InvalidOperation error: {e}. The fix is to ensure `create_index` is called immediately after connection.")
     exit()
 
 # --- Pyrogram Client ---
@@ -85,21 +71,14 @@ app = Client(
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    parse_mode=enums.ParseMode.HTML,
-    max_concurrent_transfers=5
+    parse_mode=enums.ParseMode.HTML
 )
 
 # --- Helper Functions ---
-def generate_unique_id():
-    """Generates a highly unique, time-based ID."""
-    return f"{int(time.time())}_{generate_random_string()}"
-
-def generate_random_string(length=10):
-    """Generates a secure, random string."""
-    return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
+def generate_random_string(length=8):
+    return ''.join(random.choices(string.ascii_lowercase + string.digits, k=length))
 
 def human_readable_size(size):
-    """Converts bytes to a human-readable format."""
     if size < 1024:
         return f"{size} B"
     for unit in ['KB', 'MB', 'GB', 'TB']:
@@ -108,7 +87,6 @@ def human_readable_size(size):
             return f"{size:.2f} {unit}"
 
 def progress_callback(current, total, msg_obj, start_time):
-    """Callback function for showing a real-time progress bar during uploads."""
     percentage = current * 100 / total
     progress_bar = "".join(["■" for _ in range(int(percentage / 10))])
     empty_bar = "".join(["□" for _ in range(10 - int(percentage / 10))])
@@ -122,7 +100,7 @@ def progress_callback(current, total, msg_obj, start_time):
 
     try:
         msg_obj.edit_text(
-            f"**UPLOADING...**\n"
+            f"**Progress:**\n"
             f"[{progress_bar}{empty_bar}] {percentage:.1f}%\n"
             f"**Uploaded:** {human_readable_size(current)} / {human_readable_size(total)}\n"
             f"{speed_text}"
@@ -132,7 +110,6 @@ def progress_callback(current, total, msg_obj, start_time):
         pass
 
 async def is_user_member(client: Client, user_id: int) -> bool:
-    """Checks if a user is a member of the update channel."""
     if not UPDATE_CHANNEL:
         return True
     try:
@@ -145,41 +122,21 @@ async def is_user_member(client: Client, user_id: int) -> bool:
         return False
 
 async def get_bot_mode() -> str:
-    """Retrieves the current bot operation mode from the database."""
     setting = settings_collection.find_one({"_id": "bot_mode"})
     if setting:
         return setting.get("mode", "public")
     settings_collection.update_one({"_id": "bot_mode"}, {"$set": {"mode": "public"}}, upsert=True)
     return "public"
 
-async def log_user_action(user_id, action, details=None):
-    """Logs user actions to a private channel."""
-    if LOG_CHANNEL:
-        log_text = (
-            f"👤 **User Action Log**\n"
-            f"**User:** <a href='tg://user?id={user_id}'>{user_id}</a>\n"
-            f"**Action:** `{action}`\n"
-            f"**Time:** `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`"
-        )
-        if details:
-            log_text += f"\n**Details:** `{details}`"
-        
-        try:
-            await app.send_message(LOG_CHANNEL, log_text, disable_web_page_preview=True)
-        except Exception as e:
-            logging.error(f"Failed to send log message: {e}")
-
 # --- Bot Command Handlers ---
 
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client: Client, message: Message):
-    """Handles the /start command, including deep links for files."""
+    # **ADVANCED FEATURE**: Store user info and check for ban status
     user_id = message.from_user.id
-    
-    # Track user in database
     users_collection.update_one(
         {"user_id": user_id},
-        {"$set": {"last_seen": datetime.now(), "is_banned": False}},
+        {"$set": {"last_seen": time.time(), "is_banned": False}},
         upsert=True
     )
     
@@ -199,24 +156,25 @@ async def start_handler(client: Client, message: Message):
 
         file_record = files_collection.find_one({"_id": link_id})
         if file_record:
-            await log_user_action(user_id, "file_access", details=f"Link ID: {link_id}")
-            try:
-                if 'message_ids' in file_record:
-                    status_msg = await message.reply("⏳ Fetching your files...", quote=True)
-                    for msg_id in file_record['message_ids']:
+            if 'message_ids' in file_record:
+                status_msg = await message.reply("⏳ Fetching your files...", quote=True)
+                for msg_id in file_record['message_ids']:
+                    try:
                         await client.copy_message(chat_id=user_id, from_chat_id=LOG_CHANNEL, message_id=msg_id)
-                    await status_msg.edit_text("✅ All files have been sent!")
-                elif 'message_id' in file_record:
+                    except Exception as e:
+                        logging.error(f"Error copying file with ID {msg_id}: {e}")
+                await status_msg.edit_text("✅ All files have been sent!")
+            elif 'message_id' in file_record:
+                try:
                     await client.copy_message(chat_id=user_id, from_chat_id=LOG_CHANNEL, message_id=file_record['message_id'])
-            except Exception as e:
-                await message.reply(f"❌ Sorry, an error occurred while sending the file.\n`Error: {e}`")
+                except Exception as e:
+                    await message.reply(f"❌ Sorry, an error occurred while sending the file.\n`Error: {e}`")
         else:
             await message.reply("🤔 Content not found! The link may be incorrect or has expired.")
     else:
         welcome_image_url = "https://envs.sh/L6I.jpg/IMG20250922630.jpg"
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("❓ How to Use", callback_data="help_info")],
-            [InlineKeyboardButton("⚙️ Bot Settings", callback_data="open_settings") if user_id in ADMINS else InlineKeyboardButton("🚀 More", url="https://t.me/your_channel_link")],
+            [InlineKeyboardButton("❓ How to Use", callback_data="help_info")]
         ])
         
         await message.reply_photo(
@@ -226,25 +184,9 @@ async def start_handler(client: Client, message: Message):
             reply_markup=keyboard
         )
 
-# --- Admin Command Handlers ---
-
-@app.on_message(filters.command("settings") & filters.private & filters.user(ADMINS))
-async def settings_panel_handler(client: Client, message: Message):
-    """Admin-only command to open the bot settings panel."""
-    current_mode = await get_bot_mode()
-    
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"Current Mode: {current_mode.upper()} 🔄", callback_data="toggle_mode")],
-        [InlineKeyboardButton("Manage Banned Users 🚫", callback_data="manage_bans")],
-        [InlineKeyboardButton("Edit Welcome Message ✍️", callback_data="edit_welcome")],
-        [InlineKeyboardButton("Close ❌", callback_data="close_settings")],
-    ])
-    
-    await message.reply("⚙️ **Admin Settings Panel**", reply_markup=keyboard)
-
+# **NEW ADVANCED FEATURE**: Status, Ban, Unban, and Broadcast commands
 @app.on_message(filters.command("status") & filters.private & filters.user(ADMINS))
 async def status_handler(client: Client, message: Message):
-    """Admin command to check bot status."""
     db_status = "Connected ✅"
     try:
         client.mongo_client.admin.command('ping')
@@ -253,23 +195,43 @@ async def status_handler(client: Client, message: Message):
     
     current_mode = await get_bot_mode()
     total_users = users_collection.count_documents({})
-    total_files = files_collection.count_documents({})
     
     status_text = (
         "📊 **Bot Status**\n\n"
         f"**Database:** {db_status}\n"
         f"**File Upload Mode:** `{current_mode.upper()}`\n"
         f"**Total Users:** {total_users}\n"
-        f"**Total Files Stored:** {total_files}\n"
         f"**Admins:** {len(ADMINS)}"
     )
     
     await message.reply(status_text)
-    await log_user_action(message.from_user.id, "check_status")
+
+@app.on_message(filters.command("ban") & filters.private & filters.user(ADMINS))
+async def ban_user_handler(client: Client, message: Message):
+    if len(message.command) < 2 or not message.command[1].isdigit():
+        await message.reply("❌ **Usage:** `/ban [user_id]`")
+        return
+    
+    user_id_to_ban = int(message.command[1])
+    if user_id_to_ban in ADMINS:
+        await message.reply("❌ You cannot ban another admin.")
+        return
+
+    users_collection.update_one({"user_id": user_id_to_ban}, {"$set": {"is_banned": True}})
+    await message.reply(f"🚫 User `{user_id_to_ban}` has been banned.")
+
+@app.on_message(filters.command("unban") & filters.private & filters.user(ADMINS))
+async def unban_user_handler(client: Client, message: Message):
+    if len(message.command) < 2 or not message.command[1].isdigit():
+        await message.reply("❌ **Usage:** `/unban [user_id]`")
+        return
+    
+    user_id_to_unban = int(message.command[1])
+    users_collection.update_one({"user_id": user_id_to_unban}, {"$set": {"is_banned": False}})
+    await message.reply(f"✅ User `{user_id_to_unban}` has been unbanned.")
 
 @app.on_message(filters.command("broadcast") & filters.private & filters.user(ADMINS))
 async def broadcast_handler(client: Client, message: Message):
-    """Admin command to broadcast a message to all users."""
     if len(message.command) < 2:
         await message.reply("❌ **Usage:** `/broadcast [message]`")
         return
@@ -278,7 +240,6 @@ async def broadcast_handler(client: Client, message: Message):
     user_count = 0
     
     await message.reply("⏳ Starting broadcast...")
-    await log_user_action(message.from_user.id, "broadcast", details=f"Message: {broadcast_message[:50]}")
     
     for user in users_collection.find():
         try:
@@ -292,39 +253,9 @@ async def broadcast_handler(client: Client, message: Message):
     
     await message.reply(f"✅ Broadcast complete! Sent message to {user_count} users.")
 
-@app.on_message(filters.command("ban") & filters.private & filters.user(ADMINS))
-async def ban_user_handler(client: Client, message: Message):
-    """Admin command to ban a user."""
-    if len(message.command) < 2 or not message.command[1].isdigit():
-        await message.reply("❌ **Usage:** `/ban [user_id]`")
-        return
-    
-    user_id_to_ban = int(message.command[1])
-    if user_id_to_ban in ADMINS:
-        await message.reply("❌ You cannot ban another admin.")
-        return
-
-    users_collection.update_one({"user_id": user_id_to_ban}, {"$set": {"is_banned": True}})
-    await message.reply(f"🚫 User `{user_id_to_ban}` has been banned.")
-    await log_user_action(message.from_user.id, "ban_user", details=f"Banned user ID: {user_id_to_ban}")
-
-@app.on_message(filters.command("unban") & filters.private & filters.user(ADMINS))
-async def unban_user_handler(client: Client, message: Message):
-    """Admin command to unban a user."""
-    if len(message.command) < 2 or not message.command[1].isdigit():
-        await message.reply("❌ **Usage:** `/unban [user_id]`")
-        return
-    
-    user_id_to_unban = int(message.command[1])
-    users_collection.update_one({"user_id": user_id_to_unban}, {"$set": {"is_banned": False}})
-    await message.reply(f"✅ User `{user_id_to_unban}` has been unbanned.")
-    await log_user_action(message.from_user.id, "unban_user", details=f"Unbanned user ID: {user_id_to_unban}")
-
-# --- Callback Query Handlers ---
 
 @app.on_callback_query(filters.regex("help_info"))
 async def help_callback_handler(client: Client, callback_query: CallbackQuery):
-    """Callback for the 'How to Use' button."""
     await callback_query.answer("Here's how to use me!", show_alert=True)
     help_text = (
         "**How I Work:**\n\n"
@@ -333,48 +264,121 @@ async def help_callback_handler(client: Client, callback_query: CallbackQuery):
         "**3. Share:** Anyone can use the link to get the file from me.\n\n"
         "**Tip:** You can send multiple files as an album, and I'll create a single link for all of them!"
     )
-    await callback_query.message.edit_caption(help_text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_to_start")]]))
+    await callback_query.message.edit_caption(help_text)
 
-@app.on_callback_query(filters.regex("back_to_start"))
-async def back_to_start_callback(client: Client, callback_query: CallbackQuery):
-    """Brings the user back to the main start message."""
-    welcome_image_url = "https://envs.sh/L6I.jpg/IMG20250922630.jpg"
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("❓ How to Use", callback_data="help_info")],
-        [InlineKeyboardButton("⚙️ Bot Settings", callback_data="open_settings") if callback_query.from_user.id in ADMINS else InlineKeyboardButton("🚀 More", url="https://t.me/your_channel_link")],
-    ])
+@app.on_message(filters.private & (filters.document | filters.video | filters.photo | filters.audio))
+async def file_handler(client: Client, message: Message):
+    user_id = message.from_user.id
+    user_status = users_collection.find_one({"user_id": user_id})
+    if user_status and user_status.get("is_banned"):
+        await message.reply("🚫 You are banned from using this bot.")
+        return
+
+    bot_mode = await get_bot_mode()
+    if bot_mode == "private" and user_id not in ADMINS:
+        await message.reply("😔 **Sorry!** At the moment, only admins can upload files.")
+        return
+
+    if message.media_group_id:
+        if files_collection.find_one({"media_group_id": message.media_group_id}):
+            return
+
+        status_msg = await message.reply("⏳ Processing your files...", quote=True)
+        try:
+            media_group_messages = []
+            async for msg in client.get_chat_history(message.chat.id, limit=20):
+                if msg.media_group_id == message.media_group_id and (msg.document or msg.video or msg.photo or msg.audio):
+                    media_group_messages.append(msg)
+            
+            if not media_group_messages:
+                await status_msg.edit_text("❌ An error occurred while processing the album. Please try again.")
+                return
+
+            forwarded_message_ids = []
+            for msg in media_group_messages:
+                forwarded_message = await msg.forward(LOG_CHANNEL)
+                forwarded_message_ids.append(forwarded_message.id)
+
+            link_id = f"batch_{generate_random_string()}"
+            files_collection.insert_one({
+                '_id': link_id,
+                'media_group_id': message.media_group_id,
+                'message_ids': forwarded_message_ids
+            })
+            
+            bot_username = (await client.get_me()).username
+            share_link = f"https://t.me/{bot_username}?start={link_id}"
+            
+            await status_msg.edit_text(
+                f"✅ **Link Generated!**\n\n🔗 Your Link: `{share_link}`\n\n"
+                f"**Note:** This link contains all **{len(forwarded_message_ids)}** files.",
+                disable_web_page_preview=True
+            )
+
+        except DuplicateKeyError:
+            # **ADVANCED FEATURE**: Handle rare duplicate key errors gracefully
+            await status_msg.edit_text("❌ A temporary issue occurred. Please try sending the files again.")
+        except Exception as e:
+            logging.error(f"Album handling error: {e}")
+            await status_msg.edit_text(f"❌ **Error!**\n\nSomething went wrong. Please try again.\n`Details: {e}`")
+
+    else: # Single file processing
+        status_msg = await message.reply("⏳ Preparing to upload...", quote=True)
+        try:
+            start_time = time.time()
+            forwarded_message = await client.copy_message(
+                chat_id=LOG_CHANNEL,
+                from_chat_id=message.chat.id,
+                message_id=message.id,
+                progress=progress_callback,
+                progress_args=(status_msg, start_time)
+            )
+            
+            file_id_str = f"file_{generate_random_string()}"
+            files_collection.insert_one({'_id': file_id_str, 'message_id': forwarded_message.id})
+            bot_username = (await client.get_me()).username
+            share_link = f"https://t.me/{bot_username}?start={file_id_str}"
+            
+            await status_msg.edit_text(
+                f"✅ **Link Generated!**\n\n🔗 Your Link: `{share_link}`",
+                disable_web_page_preview=True
+            )
+        except DuplicateKeyError:
+            await status_msg.edit_text("❌ A temporary issue occurred. Please try sending the file again.")
+        except Exception as e:
+            logging.error(f"File handling error: {e}")
+            await status_msg.edit_text(f"❌ **Error!**\n\nSomething went wrong. Please try again.\n`Details: {e}`")
+
+
+@app.on_callback_query(filters.regex(r"^set_mode_"))
+async def set_mode_callback(client: Client, callback_query: CallbackQuery):
+    if callback_query.from_user.id not in ADMINS:
+        await callback_query.answer("Permission Denied!", show_alert=True)
+        return
+        
+    new_mode = callback_query.data.split("_")[2]
     
-    await callback_query.message.edit_media(
-        media=InputMediaPhoto(welcome_image_url, caption=f"👋 **Hello, {callback_query.from_user.first_name}!**\n\nI'm your personal cloud link generator. Simply send me any file or a group of files, and I'll give you a clean, shareable link!"),
-        reply_markup=keyboard
+    settings_collection.update_one(
+        {"_id": "bot_mode"},
+        {"$set": {"mode": new_mode}},
+        upsert=True
     )
-    await callback_query.answer()
-
-@app.on_callback_query(filters.regex("toggle_mode") & filters.user(ADMINS))
-async def toggle_mode_callback(client: Client, callback_query: CallbackQuery):
-    """Toggles the bot's operation mode."""
-    current_mode = await get_bot_mode()
-    new_mode = "private" if current_mode == "public" else "public"
-    
-    settings_collection.update_one({"_id": "bot_mode"}, {"$set": {"mode": new_mode}}, upsert=True)
     
     await callback_query.answer(f"Mode set to {new_mode.upper()}!", show_alert=True)
     
-    await log_user_action(callback_query.from_user.id, "toggle_mode", details=f"New mode: {new_mode}")
+    public_button = InlineKeyboardButton("🌍 Public (Anyone)", callback_data="set_mode_public")
+    private_button = InlineKeyboardButton("🔒 Private (Admins Only)", callback_data="set_mode_private")
+    keyboard = InlineKeyboardMarkup([[public_button], [private_button]])
     
-    current_mode = await get_bot_mode()
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"Current Mode: {current_mode.upper()} 🔄", callback_data="toggle_mode")],
-        [InlineKeyboardButton("Manage Banned Users 🚫", callback_data="manage_bans")],
-        [InlineKeyboardButton("Edit Welcome Message ✍️", callback_data="edit_welcome")],
-        [InlineKeyboardButton("Close ❌", callback_data="close_settings")],
-    ])
-    
-    await callback_query.message.edit_text(f"⚙️ **Admin Settings Panel**", reply_markup=keyboard)
+    await callback_query.message.edit_text(
+        f"⚙️ **Bot Settings**\n\n"
+        f"✅ The file upload mode is now **{new_mode.upper()}**.\n\n"
+        f"Select a new mode:",
+        reply_markup=keyboard
+    )
 
-@app.on_callback_query(filters.regex("check_join_"))
+@app.on_callback_query(filters.regex(r"^check_join_"))
 async def check_join_callback(client: Client, callback_query: CallbackQuery):
-    """Handles the 'I Have Joined' button after force join."""
     user_id = callback_query.from_user.id
     link_id = callback_query.data.split("_", 2)[2]
 
@@ -398,142 +402,10 @@ async def check_join_callback(client: Client, callback_query: CallbackQuery):
     else:
         await callback_query.answer("You haven't joined the channel yet. Please join and try again.", show_alert=True)
 
-# --- File Handler ---
-
-@app.on_message(filters.private & (filters.document | filters.video | filters.photo | filters.audio))
-async def file_handler(client: Client, message: Message):
-    """Main file handling logic, supporting single files and albums."""
-    user_id = message.from_user.id
-    user_status = users_collection.find_one({"user_id": user_id})
-    if user_status and user_status.get("is_banned"):
-        await message.reply("🚫 You are banned from using this bot.")
-        return
-
-    bot_mode = await get_bot_mode()
-    if bot_mode == "private" and user_id not in ADMINS:
-        await message.reply("😔 **Sorry!** At the moment, only admins can upload files.")
-        return
-
-    if message.media_group_id:
-        if files_collection.find_one({"media_group_id": message.media_group_id}):
-            return
-
-        status_msg = await message.reply("⏳ Processing your files...", quote=True)
-        try:
-            await asyncio.sleep(2)
-            
-            media_group_messages = []
-            async for msg in client.get_chat_history(message.chat.id, limit=20):
-                if msg.media_group_id == message.media_group_id:
-                    media_group_messages.append(msg)
-            
-            if not media_group_messages:
-                await status_msg.edit_text("❌ An error occurred while processing the album. Please try again.")
-                return
-
-            forwarded_message_ids = []
-            for msg in media_group_messages:
-                forwarded_message = await msg.forward(LOG_CHANNEL)
-                forwarded_message_ids.append(forwarded_message.id)
-
-            link_id = f"batch_{generate_unique_id()}"
-            
-            files_collection.insert_one({
-                '_id': link_id,
-                'media_group_id': message.media_group_id,
-                'message_ids': forwarded_message_ids,
-                'created_at': datetime.now(),
-                'expires_at': datetime.now() + timedelta(days=365)
-            })
-            
-            bot_username = (await client.get_me()).username
-            share_link = f"https://t.me/{bot_username}?start={link_id}"
-            
-            await status_msg.edit_text(
-                f"✅ **Link Generated!**\n\n🔗 Your Link: `{share_link}`\n\n"
-                f"**Note:** This link contains all **{len(forwarded_message_ids)}** files.",
-                disable_web_page_preview=True
-            )
-            await log_user_action(user_id, "album_link_generated", details=f"Link ID: {link_id}")
-
-        except DuplicateKeyError:
-            await status_msg.edit_text("❌ A temporary issue occurred. Please try sending the files again in a few moments.")
-            logging.warning("Duplicate key error on album insert. Retrying with new unique ID.")
-        except Exception as e:
-            logging.error(f"Album handling error: {e}")
-            await status_msg.edit_text(f"❌ **Error!**\n\nSomething went wrong. Please try again.\n`Details: {e}`")
-    else:
-        # Single file processing
-        status_msg = await message.reply("⏳ Preparing to upload...", quote=True)
-        try:
-            start_time = time.time()
-            forwarded_message = await client.copy_message(
-                chat_id=LOG_CHANNEL,
-                from_chat_id=message.chat.id,
-                message_id=message.id,
-                progress=progress_callback,
-                progress_args=(status_msg, start_time)
-            )
-            
-            file_id_str = f"file_{generate_unique_id()}"
-            
-            files_collection.insert_one({
-                '_id': file_id_str,
-                'message_id': forwarded_message.id,
-                'created_at': datetime.now(),
-                'expires_at': datetime.now() + timedelta(days=365)
-            })
-            
-            bot_username = (await client.get_me()).username
-            share_link = f"https://t.me/{bot_username}?start={file_id_str}"
-            
-            await status_msg.edit_text(
-                f"✅ **Link Generated!**\n\n🔗 Your Link: `{share_link}`",
-                disable_web_page_preview=True
-            )
-            await log_user_action(user_id, "single_file_link_generated", details=f"Link ID: {file_id_str}")
-        except DuplicateKeyError:
-            await status_msg.edit_text("❌ A temporary issue occurred. Please try sending the file again in a few moments.")
-            logging.warning("Duplicate key error on single file insert. Retrying with new unique ID.")
-        except Exception as e:
-            logging.error(f"Single file handling error: {e}")
-            await status_msg.edit_text(f"❌ **Error!**\n\nSomething went wrong. Please try again.\n`Details: {e}`")
-
-# --- Inline Mode Handler ---
-@app.on_inline_query()
-async def inline_query_handler(client: Client, inline_query):
-    """Allows users to search for files in inline mode."""
-    results = []
-    query = inline_query.query.strip().lower()
-
-    if not query:
-        results.append(
-            InlineQueryResultArticle(
-                title="Type to search for files...",
-                input_message_content=InputTextMessageContent("Start typing to search for files stored by the bot.")
-            )
-        )
-    else:
-        files = files_collection.find({"_id": {"$regex": f".*{query}.*", "$options": "i"}}).limit(20)
-        
-        for file in files:
-            link_id = file['_id']
-            bot_username = (await client.get_me()).username
-            share_link = f"https://t.me/{bot_username}?start={link_id}"
-            results.append(
-                InlineQueryResultArticle(
-                    title=f"File Link: {link_id}",
-                    description=f"Click to share this file link.",
-                    input_message_content=InputTextMessageContent(share_link)
-                )
-            )
-    
-    await client.answer_inline_query(inline_query.id, results=results, cache_time=5)
-
 # --- Start the Bot ---
 if __name__ == "__main__":
     if not ADMINS:
-        logging.warning("WARNING: ADMIN_IDS is not set. Admin commands will not work.")
+        logging.warning("WARNING: ADMIN_IDS is not set. The settings and admin commands will not work.")
     
     logging.info("Starting Flask web server...")
     flask_thread = Thread(target=run_flask)
