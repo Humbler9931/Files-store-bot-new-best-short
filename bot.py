@@ -14,7 +14,7 @@ from pyrogram.types import (
     InputMediaPhoto, InputMediaDocument, InlineQueryResultArticle, InputTextMessageContent
 )
 from pymongo import MongoClient
-from pymongo.errors import ConnectionFailure, DuplicateKeyError
+from pymongo.errors import ConnectionFailure, DuplicateKeyError, InvalidOperation
 from flask import Flask, request, jsonify
 from threading import Thread
 
@@ -28,7 +28,6 @@ def index():
 @flask_app.route('/api/webhook', methods=['POST'])
 def webhook_receiver():
     data = request.json
-    # Process webhook data here
     print(f"Received webhook data: {json.dumps(data, indent=2)}")
     return jsonify({"status": "success"}), 200
 
@@ -58,7 +57,7 @@ API_KEY = os.environ.get("API_KEY")
 # --- Global Dictionaries for temporary storage ---
 custom_caption_states = {}
 
-# --- Database Setup ---
+# --- Database Setup and Indexing ---
 try:
     client = MongoClient(MONGO_URI)
     db = client['file_link_bot']
@@ -67,12 +66,17 @@ try:
     users_collection = db['users']
     logging.info("Connected to MongoDB successfully!")
 
-    # Ensure indexes for faster lookups
-    files_collection.create_index([("link_id", 1)], unique=True)
+    # **CRITICAL FIX:** Ensure indexes are created immediately after connection
+    files_collection.create_index([("_id", 1)], unique=True)
     files_collection.create_index([("expires_at", 1)], expireAfterSeconds=0)
     users_collection.create_index([("user_id", 1)], unique=True)
+    logging.info("MongoDB indexes created/verified successfully!")
+
 except ConnectionFailure as e:
     logging.error(f"Error connecting to MongoDB: {e}")
+    exit()
+except InvalidOperation as e:
+    logging.error(f"MongoDB InvalidOperation error: {e}. This usually means an index was tried to be created after operations. The fix is to ensure `create_index` is called immediately after connection.")
     exit()
 
 # --- Pyrogram Client ---
@@ -368,7 +372,6 @@ async def toggle_mode_callback(client: Client, callback_query: CallbackQuery):
     
     await callback_query.message.edit_text(f"⚙️ **Admin Settings Panel**", reply_markup=keyboard)
 
-
 @app.on_callback_query(filters.regex("check_join_"))
 async def check_join_callback(client: Client, callback_query: CallbackQuery):
     """Handles the 'I Have Joined' button after force join."""
@@ -417,8 +420,7 @@ async def file_handler(client: Client, message: Message):
 
         status_msg = await message.reply("⏳ Processing your files...", quote=True)
         try:
-            # Wait for all parts of the album to arrive
-            await asyncio.sleep(2)  # Give Telegram time to send all parts
+            await asyncio.sleep(2)
             
             media_group_messages = []
             async for msg in client.get_chat_history(message.chat.id, limit=20):
@@ -434,7 +436,7 @@ async def file_handler(client: Client, message: Message):
                 forwarded_message = await msg.forward(LOG_CHANNEL)
                 forwarded_message_ids.append(forwarded_message.id)
 
-            link_id = f"batch_{generate_unique_id()}" # Use the new unique ID
+            link_id = f"batch_{generate_unique_id()}"
             
             files_collection.insert_one({
                 '_id': link_id,
@@ -457,7 +459,6 @@ async def file_handler(client: Client, message: Message):
         except DuplicateKeyError:
             await status_msg.edit_text("❌ A temporary issue occurred. Please try sending the files again in a few moments.")
             logging.warning("Duplicate key error on album insert. Retrying with new unique ID.")
-            # The next time the user tries, a new ID will be generated.
         except Exception as e:
             logging.error(f"Album handling error: {e}")
             await status_msg.edit_text(f"❌ **Error!**\n\nSomething went wrong. Please try again.\n`Details: {e}`")
@@ -474,7 +475,7 @@ async def file_handler(client: Client, message: Message):
                 progress_args=(status_msg, start_time)
             )
             
-            file_id_str = f"file_{generate_unique_id()}" # Use the new unique ID
+            file_id_str = f"file_{generate_unique_id()}"
             
             files_collection.insert_one({
                 '_id': file_id_str,
@@ -541,4 +542,3 @@ if __name__ == "__main__":
     logging.info("Bot is starting...")
     app.run()
     logging.info("Bot has stopped.")
-
