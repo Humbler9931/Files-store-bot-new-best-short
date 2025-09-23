@@ -14,7 +14,7 @@ from pyrogram.types import (
     InputMediaPhoto, InputMediaDocument, InlineQueryResultArticle, InputTextMessageContent
 )
 from pymongo import MongoClient
-from pymongo.errors import ConnectionFailure
+from pymongo.errors import ConnectionFailure, DuplicateKeyError
 from flask import Flask, request, jsonify
 from threading import Thread
 
@@ -53,10 +53,9 @@ LOG_CHANNEL = int(os.environ.get("LOG_CHANNEL"))
 UPDATE_CHANNEL = os.environ.get("UPDATE_CHANNEL")
 ADMIN_IDS_STR = os.environ.get("ADMIN_IDS", "")
 ADMINS = [int(admin_id.strip()) for admin_id in ADMIN_IDS_STR.split(',') if admin_id]
-API_KEY = os.environ.get("API_KEY") # For a new API feature
+API_KEY = os.environ.get("API_KEY")
 
 # --- Global Dictionaries for temporary storage ---
-# To handle multi-step processes like custom captions
 custom_caption_states = {}
 
 # --- Database Setup ---
@@ -83,10 +82,14 @@ app = Client(
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
     parse_mode=enums.ParseMode.HTML,
-    max_concurrent_transfers=5 # For better performance with multiple uploads
+    max_concurrent_transfers=5
 )
 
 # --- Helper Functions ---
+def generate_unique_id():
+    """Generates a highly unique, time-based ID."""
+    return f"{int(time.time())}_{generate_random_string()}"
+
 def generate_random_string(length=10):
     """Generates a secure, random string."""
     return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
@@ -195,13 +198,11 @@ async def start_handler(client: Client, message: Message):
             await log_user_action(user_id, "file_access", details=f"Link ID: {link_id}")
             try:
                 if 'message_ids' in file_record:
-                    # Handle batch files
                     status_msg = await message.reply("⏳ Fetching your files...", quote=True)
                     for msg_id in file_record['message_ids']:
                         await client.copy_message(chat_id=user_id, from_chat_id=LOG_CHANNEL, message_id=msg_id)
                     await status_msg.edit_text("✅ All files have been sent!")
                 elif 'message_id' in file_record:
-                    # Handle single file
                     await client.copy_message(chat_id=user_id, from_chat_id=LOG_CHANNEL, message_id=file_record['message_id'])
             except Exception as e:
                 await message.reply(f"❌ Sorry, an error occurred while sending the file.\n`Error: {e}`")
@@ -279,7 +280,7 @@ async def broadcast_handler(client: Client, message: Message):
         try:
             await app.send_message(user['user_id'], broadcast_message)
             user_count += 1
-            await asyncio.sleep(0.1) # Avoid flood waits
+            await asyncio.sleep(0.1)
         except FloodWait as e:
             await asyncio.sleep(e.value)
         except Exception as e:
@@ -416,17 +417,14 @@ async def file_handler(client: Client, message: Message):
 
         status_msg = await message.reply("⏳ Processing your files...", quote=True)
         try:
-            # A more robust way to get all messages in an album
+            # Wait for all parts of the album to arrive
+            await asyncio.sleep(2)  # Give Telegram time to send all parts
+            
             media_group_messages = []
-            album_start_time = time.time()
-            while time.time() - album_start_time < 5: # Wait for 5 seconds for all album parts to arrive
-                async for msg in client.get_chat_history(message.chat.id, limit=20):
-                    if msg.media_group_id == message.media_group_id and msg not in media_group_messages:
-                        media_group_messages.append(msg)
-                if len(media_group_messages) >= 10: # Max 10 files per album
-                    break
-                await asyncio.sleep(0.5)
-
+            async for msg in client.get_chat_history(message.chat.id, limit=20):
+                if msg.media_group_id == message.media_group_id:
+                    media_group_messages.append(msg)
+            
             if not media_group_messages:
                 await status_msg.edit_text("❌ An error occurred while processing the album. Please try again.")
                 return
@@ -436,13 +434,14 @@ async def file_handler(client: Client, message: Message):
                 forwarded_message = await msg.forward(LOG_CHANNEL)
                 forwarded_message_ids.append(forwarded_message.id)
 
-            link_id = f"batch_{generate_random_string()}"
+            link_id = f"batch_{generate_unique_id()}" # Use the new unique ID
+            
             files_collection.insert_one({
                 '_id': link_id,
                 'media_group_id': message.media_group_id,
                 'message_ids': forwarded_message_ids,
                 'created_at': datetime.now(),
-                'expires_at': datetime.now() + timedelta(days=365) # Links expire in 1 year
+                'expires_at': datetime.now() + timedelta(days=365)
             })
             
             bot_username = (await client.get_me()).username
@@ -455,6 +454,10 @@ async def file_handler(client: Client, message: Message):
             )
             await log_user_action(user_id, "album_link_generated", details=f"Link ID: {link_id}")
 
+        except DuplicateKeyError:
+            await status_msg.edit_text("❌ A temporary issue occurred. Please try sending the files again in a few moments.")
+            logging.warning("Duplicate key error on album insert. Retrying with new unique ID.")
+            # The next time the user tries, a new ID will be generated.
         except Exception as e:
             logging.error(f"Album handling error: {e}")
             await status_msg.edit_text(f"❌ **Error!**\n\nSomething went wrong. Please try again.\n`Details: {e}`")
@@ -471,7 +474,8 @@ async def file_handler(client: Client, message: Message):
                 progress_args=(status_msg, start_time)
             )
             
-            file_id_str = f"file_{generate_random_string()}"
+            file_id_str = f"file_{generate_unique_id()}" # Use the new unique ID
+            
             files_collection.insert_one({
                 '_id': file_id_str,
                 'message_id': forwarded_message.id,
@@ -487,6 +491,9 @@ async def file_handler(client: Client, message: Message):
                 disable_web_page_preview=True
             )
             await log_user_action(user_id, "single_file_link_generated", details=f"Link ID: {file_id_str}")
+        except DuplicateKeyError:
+            await status_msg.edit_text("❌ A temporary issue occurred. Please try sending the file again in a few moments.")
+            logging.warning("Duplicate key error on single file insert. Retrying with new unique ID.")
         except Exception as e:
             logging.error(f"Single file handling error: {e}")
             await status_msg.edit_text(f"❌ **Error!**\n\nSomething went wrong. Please try again.\n`Details: {e}`")
@@ -506,10 +513,6 @@ async def inline_query_handler(client: Client, inline_query):
             )
         )
     else:
-        # A simple search based on file name or other metadata
-        # This part requires more advanced database queries to be truly effective
-        # For now, it's a basic example.
-        # You'd need to store file names in your database.
         files = files_collection.find({"_id": {"$regex": f".*{query}.*", "$options": "i"}}).limit(20)
         
         for file in files:
