@@ -4,6 +4,7 @@ import random
 import string
 import time
 import asyncio
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from pyrogram import Client, filters, enums
 from pyrogram.errors import UserNotParticipant, FloodWait
@@ -49,12 +50,12 @@ try:
     client = MongoClient(MONGO_URI)
     db = client['file_link_bot']
     files_collection = db['files']
-    users_collection = db['users'] # New collection for user tracking
+    users_collection = db['users']
     settings_collection = db['settings']
     logging.info("Connected to MongoDB successfully!")
 
-    # **ADVANCED FEATURE**: Create indexes for faster lookups and to prevent errors
-    files_collection.create_index([("_id", 1)], unique=True)
+    # **मुख्य सुधार**: इंडेक्स को तुरंत बनाएं ताकि कोई ऑपरेशन विफल न हो
+    files_collection.create_index([("link_id", 1)], unique=True)
     users_collection.create_index([("user_id", 1)], unique=True)
     logging.info("MongoDB indexes created/verified successfully!")
 
@@ -62,7 +63,7 @@ except ConnectionFailure as e:
     logging.error(f"Error connecting to MongoDB: {e}")
     exit()
 except InvalidOperation as e:
-    logging.error(f"MongoDB InvalidOperation error: {e}. The fix is to ensure `create_index` is called immediately after connection.")
+    logging.error(f"MongoDB InvalidOperation error: {e}. Fix: Ensure `create_index` is called immediately after connection.")
     exit()
 
 # --- Pyrogram Client ---
@@ -76,9 +77,15 @@ app = Client(
 
 # --- Helper Functions ---
 def generate_random_string(length=8):
+    """Generates a secure, random string."""
     return ''.join(random.choices(string.ascii_lowercase + string.digits, k=length))
 
+def generate_unique_id():
+    """Generates a highly unique, time-based ID to prevent DuplicateKeyError."""
+    return f"{int(time.time())}_{generate_random_string()}"
+
 def human_readable_size(size):
+    """Converts bytes to a human-readable format."""
     if size < 1024:
         return f"{size} B"
     for unit in ['KB', 'MB', 'GB', 'TB']:
@@ -87,6 +94,7 @@ def human_readable_size(size):
             return f"{size:.2f} {unit}"
 
 def progress_callback(current, total, msg_obj, start_time):
+    """Callback function for showing a real-time progress bar during uploads."""
     percentage = current * 100 / total
     progress_bar = "".join(["■" for _ in range(int(percentage / 10))])
     empty_bar = "".join(["□" for _ in range(10 - int(percentage / 10))])
@@ -110,6 +118,7 @@ def progress_callback(current, total, msg_obj, start_time):
         pass
 
 async def is_user_member(client: Client, user_id: int) -> bool:
+    """Checks if a user is a member of the update channel."""
     if not UPDATE_CHANNEL:
         return True
     try:
@@ -122,6 +131,7 @@ async def is_user_member(client: Client, user_id: int) -> bool:
         return False
 
 async def get_bot_mode() -> str:
+    """Retrieves the current bot operation mode from the database."""
     setting = settings_collection.find_one({"_id": "bot_mode"})
     if setting:
         return setting.get("mode", "public")
@@ -132,7 +142,6 @@ async def get_bot_mode() -> str:
 
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client: Client, message: Message):
-    # **ADVANCED FEATURE**: Store user info and check for ban status
     user_id = message.from_user.id
     users_collection.update_one(
         {"user_id": user_id},
@@ -142,7 +151,6 @@ async def start_handler(client: Client, message: Message):
     
     if len(message.command) > 1:
         link_id = message.command[1]
-
         if UPDATE_CHANNEL and not await is_user_member(client, user_id):
             join_button = InlineKeyboardButton("🔗 Join Channel", url=f"https://t.me/{UPDATE_CHANNEL}")
             joined_button = InlineKeyboardButton("✅ I Have Joined", callback_data=f"check_join_{link_id}")
@@ -184,7 +192,7 @@ async def start_handler(client: Client, message: Message):
             reply_markup=keyboard
         )
 
-# **NEW ADVANCED FEATURE**: Status, Ban, Unban, and Broadcast commands
+# --- Admin Commands ---
 @app.on_message(filters.command("status") & filters.private & filters.user(ADMINS))
 async def status_handler(client: Client, message: Message):
     db_status = "Connected ✅"
@@ -253,7 +261,7 @@ async def broadcast_handler(client: Client, message: Message):
     
     await message.reply(f"✅ Broadcast complete! Sent message to {user_count} users.")
 
-
+# --- Callback Query Handlers ---
 @app.on_callback_query(filters.regex("help_info"))
 async def help_callback_handler(client: Client, callback_query: CallbackQuery):
     await callback_query.answer("Here's how to use me!", show_alert=True)
@@ -299,7 +307,7 @@ async def file_handler(client: Client, message: Message):
                 forwarded_message = await msg.forward(LOG_CHANNEL)
                 forwarded_message_ids.append(forwarded_message.id)
 
-            link_id = f"batch_{generate_random_string()}"
+            link_id = f"batch_{generate_unique_id()}"
             files_collection.insert_one({
                 '_id': link_id,
                 'media_group_id': message.media_group_id,
@@ -316,7 +324,6 @@ async def file_handler(client: Client, message: Message):
             )
 
         except DuplicateKeyError:
-            # **ADVANCED FEATURE**: Handle rare duplicate key errors gracefully
             await status_msg.edit_text("❌ A temporary issue occurred. Please try sending the files again.")
         except Exception as e:
             logging.error(f"Album handling error: {e}")
@@ -334,7 +341,7 @@ async def file_handler(client: Client, message: Message):
                 progress_args=(status_msg, start_time)
             )
             
-            file_id_str = f"file_{generate_random_string()}"
+            file_id_str = f"file_{generate_unique_id()}"
             files_collection.insert_one({'_id': file_id_str, 'message_id': forwarded_message.id})
             bot_username = (await client.get_me()).username
             share_link = f"https://t.me/{bot_username}?start={file_id_str}"
@@ -349,33 +356,6 @@ async def file_handler(client: Client, message: Message):
             logging.error(f"File handling error: {e}")
             await status_msg.edit_text(f"❌ **Error!**\n\nSomething went wrong. Please try again.\n`Details: {e}`")
 
-
-@app.on_callback_query(filters.regex(r"^set_mode_"))
-async def set_mode_callback(client: Client, callback_query: CallbackQuery):
-    if callback_query.from_user.id not in ADMINS:
-        await callback_query.answer("Permission Denied!", show_alert=True)
-        return
-        
-    new_mode = callback_query.data.split("_")[2]
-    
-    settings_collection.update_one(
-        {"_id": "bot_mode"},
-        {"$set": {"mode": new_mode}},
-        upsert=True
-    )
-    
-    await callback_query.answer(f"Mode set to {new_mode.upper()}!", show_alert=True)
-    
-    public_button = InlineKeyboardButton("🌍 Public (Anyone)", callback_data="set_mode_public")
-    private_button = InlineKeyboardButton("🔒 Private (Admins Only)", callback_data="set_mode_private")
-    keyboard = InlineKeyboardMarkup([[public_button], [private_button]])
-    
-    await callback_query.message.edit_text(
-        f"⚙️ **Bot Settings**\n\n"
-        f"✅ The file upload mode is now **{new_mode.upper()}**.\n\n"
-        f"Select a new mode:",
-        reply_markup=keyboard
-    )
 
 @app.on_callback_query(filters.regex(r"^check_join_"))
 async def check_join_callback(client: Client, callback_query: CallbackQuery):
