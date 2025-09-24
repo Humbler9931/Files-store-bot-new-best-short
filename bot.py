@@ -2,19 +2,17 @@ import os
 import logging
 import random
 import string
-import shutil
-import subprocess
 import time
 import urllib.parse
 from dotenv import load_dotenv
-from pyrogram import Client, filters, enums
+from pyrogram import Client, filters, idle
 from pyrogram.errors import UserNotParticipant
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, CallbackQuery
 from pymongo import MongoClient
 from flask import Flask
 from threading import Thread
 
-# --- Flask Web Server (To keep the bot alive on platforms like Render) ---
+# --- Flask Web Server (To keep the bot alive) ---
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
@@ -28,47 +26,48 @@ def run_flask():
 # --- Basic Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
+logging.getLogger("pymongo").setLevel(logging.WARNING)
 
 # --- Load Environment Variables ---
-dotenv_path = os.environ.get("DOTENV_PATH", ".env")
-load_dotenv(dotenv_path)
+load_dotenv(".env")
 
 # --- Configuration ---
-API_ID = int(os.environ.get("API_ID"))
-API_HASH = os.environ.get("API_HASH")
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-MONGO_URI = os.environ.get("MONGO_URI")
-LOG_CHANNEL = int(os.environ.get("LOG_CHANNEL"))
-# Main Channels for force-join
-UPDATE_CHANNELS = ["bestshayri_raj", "go_esports"]
-# Optional channels for support and dev (add your own)
-SUPPORT_CHANNEL = "bestshayri_raj"
-DEV_CHANNEL = "go_esports"
-ADMIN_IDS_STR = os.environ.get("ADMIN_IDS", "")
-ADMINS = [int(admin_id.strip()) for admin_id in ADMIN_IDS_STR.split(',') if admin_id]
+try:
+    API_ID = int(os.environ.get("API_ID"))
+    API_HASH = os.environ.get("API_HASH")
+    BOT_TOKEN = os.environ.get("BOT_TOKEN")
+    MONGO_URI = os.environ.get("MONGO_URI")
+    LOG_CHANNEL = int(os.environ.get("LOG_CHANNEL"))
+    ADMINS = [int(admin_id.strip()) for admin_id in os.environ.get("ADMINS", "").split(',') if admin_id.strip()]
+    FORCE_CHANNELS = [channel.strip() for channel in os.environ.get("FORCE_CHANNELS", "").split(',') if channel.strip()]
+except (ValueError, TypeError) as e:
+    logging.error(f"❌ Error in environment variables: {e}")
+    exit()
 
 # --- Database Setup ---
 try:
     client = MongoClient(MONGO_URI)
     db = client['file_link_bot_ultimate']
-    files_collection = db['files']
-    multi_file_collection = db['multi_files']
-    settings_collection = db['settings']
-    logging.info("MongoDB Connected Successfully!")
+    logging.info("✅ MongoDB connected successfully!")
 except Exception as e:
-    logging.error(f"❌ Error connecting to MongoDB: {e}")
+    logging.error(f"❌ Failed to connect to MongoDB: {e}")
     exit()
 
 # --- Pyrogram Client ---
-app = Client("FileLinkBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client(
+    "FileLinkBot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN
+)
 
 # --- Helper Functions ---
 def generate_random_string(length=6):
     return ''.join(random.choices(string.ascii_lowercase + string.digits, k=length))
 
-async def is_user_member_all_channels(client: Client, user_id: int) -> list:
+async def is_user_member_all_channels(client: Client, user_id: int, channels: list) -> list:
     missing_channels = []
-    for channel in UPDATE_CHANNELS:
+    for channel in channels:
         try:
             await client.get_chat_member(chat_id=f"@{channel}", user_id=user_id)
         except UserNotParticipant:
@@ -78,25 +77,27 @@ async def is_user_member_all_channels(client: Client, user_id: int) -> list:
             missing_channels.append(channel)
     return missing_channels
 
-async def get_bot_mode() -> str:
-    setting = settings_collection.find_one({"_id": "bot_mode"})
+async def get_bot_mode(db) -> str:
+    setting = db.settings.find_one({"_id": "bot_mode"})
     if setting:
         return setting.get("mode", "public")
-    settings_collection.update_one({"_id": "bot_mode"}, {"$set": {"mode": "public"}}, upsert=True)
+    db.settings.update_one({"_id": "bot_mode"}, {"$set": {"mode": "public"}}, upsert=True)
     return "public"
 
 # --- Bot Command Handlers ---
 
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client: Client, message: Message):
+    # Store user in database
+    db.users.update_one({"_id": message.from_user.id}, {"$set": {"name": message.from_user.full_name}}, upsert=True)
+
     if len(message.command) > 1:
         file_id_str = message.command[1]
-        missing_channels = await is_user_member_all_channels(client, message.from_user.id)
+        
+        missing_channels = await is_user_member_all_channels(client, message.from_user.id, FORCE_CHANNELS)
         
         if missing_channels:
-            join_buttons = []
-            for channel in missing_channels:
-                join_buttons.append([InlineKeyboardButton(f"🔗 Join @{channel}", url=f"https://t.me/{channel}")])
+            join_buttons = [[InlineKeyboardButton(f"🔗 Join @{ch}", url=f"https://t.me/{ch}")] for ch in missing_channels]
             join_buttons.append([InlineKeyboardButton("✅ I Have Joined", callback_data=f"check_join_{file_id_str}")])
 
             await message.reply(
@@ -106,15 +107,15 @@ async def start_handler(client: Client, message: Message):
             )
             return
 
-        file_record = files_collection.find_one({"_id": file_id_str})
+        file_record = db.files.find_one({"_id": file_id_str})
         if file_record:
             try:
                 await client.copy_message(chat_id=message.from_user.id, from_chat_id=LOG_CHANNEL, message_id=file_record['message_id'])
             except Exception as e:
-                await message.reply(f"❌ Sorry, an error occurred while sending the file.\n`Error: {e}`")
+                await message.reply(f"❌ An error occurred while sending the file.\n`Error: {e}`")
             return
 
-        multi_file_record = multi_file_collection.find_one({"_id": file_id_str})
+        multi_file_record = db.multi_files.find_one({"_id": file_id_str})
         if multi_file_record:
             sent_count = 0
             for msg_id in multi_file_record['message_ids']:
@@ -124,41 +125,46 @@ async def start_handler(client: Client, message: Message):
                     time.sleep(0.5)
                 except Exception as e:
                     logging.error(f"Error sending multi-file message {msg_id}: {e}")
-            await message.reply(f"✅ All {sent_count} videos/files from the bundle have been sent successfully!")
+            await message.reply(f"✅ All {sent_count} files from the bundle have been sent successfully!")
             return
         
         await message.reply("🤔 File or bundle not found! The link might be wrong or expired.")
-
     else:
-        # Normal /start command with advanced buttons
         buttons = [
             [InlineKeyboardButton("📚 About", callback_data="about"),
              InlineKeyboardButton("💡 How to Use?", callback_data="help")],
-            [InlineKeyboardButton("➕ Clone Bot", callback_data="clone_info")],
             [InlineKeyboardButton("🔗 Join Channels", callback_data="join_channels")]
         ]
         
         await message.reply(
             f"**Hello, {message.from_user.first_name}! I'm a powerful File-to-Link Bot!** 🤖\n\n"
-            "Just send me any file, or a bundle of files, and I'll give you a **permanent, shareable link** for it. It's fast, secure, and super easy! ✨",
+            "Just send me any file, or a bundle of files, and I'll give you a **permanent, shareable link** for it. "
+            "It's fast, secure, and super easy! ✨",
             reply_markup=InlineKeyboardMarkup(buttons)
         )
 
-# ... (other handlers like file_handler, multi_link_handler, and settings_handler remain the same as the previous version) ...
-
 @app.on_message(filters.private & (filters.document | filters.video | filters.photo | filters.audio))
 async def file_handler(client: Client, message: Message):
-    bot_mode = await get_bot_mode()
+    bot_mode = await get_bot_mode(db)
     if bot_mode == "private" and message.from_user.id not in ADMINS:
         await message.reply("😔 **Sorry!** Only Admins can upload files in private mode.")
         return
 
+    user_state = db.settings.find_one({"_id": message.from_user.id, "type": "temp"})
+    if user_state and user_state.get("state") == "multi_link":
+        db.settings.update_one(
+            {"_id": message.from_user.id, "type": "temp"},
+            {"$push": {"message_ids": message.id}}
+        )
+        await message.reply("File added to bundle. Send more or use `/done` to finish.", quote=True)
+        return
+        
     status_msg = await message.reply("⏳ Uploading file... Please wait a moment.", quote=True)
     
     try:
         forwarded_message = await message.forward(LOG_CHANNEL)
         file_id_str = generate_random_string()
-        files_collection.insert_one({'_id': file_id_str, 'message_id': forwarded_message.id})
+        db.files.insert_one({'_id': file_id_str, 'message_id': forwarded_message.id})
         bot_username = (await client.get_me()).username
         share_link = f"https://t.me/{bot_username}?start={file_id_str}"
         
@@ -180,28 +186,29 @@ async def multi_link_handler(client: Client, message: Message):
     if message.from_user.id not in ADMINS:
         await message.reply("❌ This command is for admins only.")
         return
-        
-    await message.reply("Forward me a series of messages. I will bundle them and give you a single link. Send /done when you are finished.")
     
-    user_id = message.from_user.id
-    settings_collection.update_one({"_id": user_id, "type": "temp"}, {"$set": {"message_ids": [], "state": "multi_link"}}, upsert=True)
+    db.settings.update_one(
+        {"_id": message.from_user.id, "type": "temp"},
+        {"$set": {"state": "multi_link", "message_ids": []}},
+        upsert=True
+    )
+    
+    await message.reply("Okay! Now, forward me the files you want to bundle together. When you're finished, send the command `/done`.")
 
 @app.on_message(filters.command("done") & filters.private)
 async def done_handler(client: Client, message: Message):
     user_id = message.from_user.id
-    user_state = settings_collection.find_one({"_id": user_id, "type": "temp"})
-
+    user_state = db.settings.find_one({"_id": user_id, "type": "temp"})
+    
     if user_state and user_state.get("state") == "multi_link":
         message_ids = user_state.get("message_ids", [])
         if not message_ids:
-            await message.reply("You haven't forwarded any files yet. Please forward them and then send /done.")
+            await message.reply("You haven't added any files to the bundle yet. Please forward them first.")
             return
-
-        status_msg = await message.reply(f"⏳ Processing {len(message_ids)} files...")
+            
+        status_msg = await message.reply(f"⏳ Processing {len(message_ids)} files... Please wait.")
         
         try:
-            multi_id_str = generate_random_string(8)
-            
             forwarded_msg_ids = []
             for msg_id in message_ids:
                 try:
@@ -210,10 +217,11 @@ async def done_handler(client: Client, message: Message):
                 except Exception as e:
                     logging.error(f"Error forwarding message {msg_id}: {e}")
             
-            multi_file_collection.insert_one({'_id': multi_id_str, 'message_ids': forwarded_msg_ids})
+            multi_file_id = generate_random_string(8)
+            db.multi_files.insert_one({'_id': multi_file_id, 'message_ids': forwarded_msg_ids})
             
             bot_username = (await client.get_me()).username
-            share_link = f"https://t.me/{bot_username}?start={multi_id_str}"
+            share_link = f"https://t.me/{bot_username}?start={multi_file_id}"
             
             share_button = InlineKeyboardButton("🔗 Share Link", url=f"https://t.me/share/url?url={share_link}")
             
@@ -224,31 +232,73 @@ async def done_handler(client: Client, message: Message):
                 reply_markup=InlineKeyboardMarkup([[share_button]]),
                 disable_web_page_preview=True
             )
-            settings_collection.delete_one({"_id": user_id, "type": "temp"})
-
+            
+            db.settings.delete_one({"_id": user_id, "type": "temp"})
+            
         except Exception as e:
             logging.error(f"Multi-file handling error: {e}")
             await status_msg.edit_text(f"❌ **Error!**\n\nSomething went wrong. Please try again.\n`Details: {e}`")
     else:
-        await message.reply("You are not in multi-link mode. Send /multi_link to start.")
+        await message.reply("You are not in multi-link mode. Send `/multi_link` to start.")
 
-@app.on_message(filters.forwarded & filters.private)
-async def forwarded_file_handler(client: Client, message: Message):
-    user_id = message.from_user.id
-    user_state = settings_collection.find_one({"_id": user_id, "type": "temp"})
+@app.on_message(filters.command("admin") & filters.private & filters.user(ADMINS))
+async def admin_panel_handler(client: Client, message: Message):
+    buttons = [
+        [InlineKeyboardButton("📊 Stats", callback_data="admin_stats"),
+         InlineKeyboardButton("⚙️ Settings", callback_data="admin_settings")],
+        [InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast")]
+    ]
+    await message.reply(
+        "**👑 Welcome to the Admin Panel!**\n\n"
+        "Select an option below to manage the bot.",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+@app.on_message(filters.command("stats") & filters.private & filters.user(ADMINS))
+async def stats_handler(client: Client, message: Message):
+    user_count = db.users.count_documents({})
+    single_files_count = db.files.count_documents({})
+    multi_files_count = db.multi_files.count_documents({})
     
-    if user_state and user_state.get("state") == "multi_link":
-        if message.document or message.video or message.photo or message.audio:
-            settings_collection.update_one({"_id": user_id, "type": "temp"}, {"$push": {"message_ids": message.id}})
-            await message.reply("File added to bundle. Forward more or send /done.", quote=True)
+    await message.reply(
+        f"📊 **Bot Statistics**\n\n"
+        f"**👥 Total Users:** `{user_count}`\n"
+        f"**📄 Single Files:** `{single_files_count}`\n"
+        f"**📦 Multi-File Bundles:** `{multi_files_count}`"
+    )
 
-@app.on_message(filters.command("settings") & filters.private)
-async def settings_handler(client: Client, message: Message):
-    if message.from_user.id not in ADMINS:
-        await message.reply("❌ You don't have permission to use this command.")
+@app.on_message(filters.command("broadcast") & filters.private & filters.user(ADMINS))
+async def broadcast_handler(client: Client, message: Message):
+    if len(message.command) < 2:
+        await message.reply("Please provide a message to broadcast. Example: `/broadcast Hello everyone!`")
         return
+
+    message_to_send = message.text.split(" ", 1)[1]
+    users = db.users.find({}, {"_id": 1})
     
-    current_mode = await get_bot_mode()
+    success_count = 0
+    failed_count = 0
+    
+    status_msg = await message.reply("⏳ Starting broadcast...")
+    
+    for user in users:
+        try:
+            await client.send_message(chat_id=user['_id'], text=message_to_send)
+            success_count += 1
+            time.sleep(0.1)
+        except Exception as e:
+            failed_count += 1
+            logging.error(f"Failed to broadcast to user {user['_id']}: {e}")
+    
+    await status_msg.edit_text(
+        f"✅ **Broadcast Complete!**\n\n"
+        f"**Success:** `{success_count}`\n"
+        f"**Failed:** `{failed_count}`"
+    )
+
+@app.on_message(filters.command("settings") & filters.private & filters.user(ADMINS))
+async def settings_handler(client: Client, message: Message):
+    current_mode = await get_bot_mode(db)
     
     public_button = InlineKeyboardButton("🌍 Public (Anyone)", callback_data="set_mode_public")
     private_button = InlineKeyboardButton("🔒 Private (Admins Only)", callback_data="set_mode_private")
@@ -263,77 +313,7 @@ async def settings_handler(client: Client, message: Message):
         reply_markup=keyboard
     )
 
-# ... (rest of the code for callbacks) ...
-
-@app.on_callback_query(filters.regex(r"^set_mode_"))
-async def set_mode_callback(client: Client, callback_query: CallbackQuery):
-    if callback_query.from_user.id not in ADMINS:
-        await callback_query.answer("Permission Denied!", show_alert=True)
-        return
-        
-    new_mode = callback_query.data.split("_")[2]
-    
-    settings_collection.update_one(
-        {"_id": "bot_mode"},
-        {"$set": {"mode": new_mode}},
-        upsert=True
-    )
-    
-    await callback_query.answer(f"Mode successfully set to {new_mode.upper()}!", show_alert=True)
-    
-    public_button = InlineKeyboardButton("🌍 Public (Anyone)", callback_data="set_mode_public")
-    private_button = InlineKeyboardButton("🔒 Private (Admins Only)", callback_data="set_mode_private")
-    keyboard = InlineKeyboardMarkup([[public_button], [private_button]])
-    
-    await callback_query.message.edit_text(
-        f"⚙️ **Bot Settings**\n\n"
-        f"✅ File upload mode is now **{new_mode.upper()}**.\n\n"
-        f"Select a new mode:",
-        reply_markup=keyboard
-    )
-
-@app.on_callback_query(filters.regex(r"^check_join_"))
-async def check_join_callback(client: Client, callback_query: CallbackQuery):
-    user_id = callback_query.from_user.id
-    file_id_str = callback_query.data.split("_", 2)[2]
-
-    missing_channels = await is_user_member_all_channels(client, user_id)
-    if not missing_channels:
-        await callback_query.answer("Thanks for joining all channels! Sending files now...", show_alert=True)
-        
-        file_record = files_collection.find_one({"_id": file_id_str})
-        if file_record:
-            try:
-                await client.copy_message(chat_id=user_id, from_chat_id=LOG_CHANNEL, message_id=file_record['message_id'])
-                await callback_query.message.delete()
-            except Exception as e:
-                await callback_query.message.edit_text(f"❌ An error occurred while sending the file.\n`Error: {e}`")
-        
-        multi_file_record = multi_file_collection.find_one({"_id": file_id_str})
-        if multi_file_record:
-            sent_count = 0
-            for msg_id in multi_file_record['message_ids']:
-                try:
-                    await client.copy_message(chat_id=user_id, from_chat_id=LOG_CHANNEL, message_id=msg_id)
-                    sent_count += 1
-                    time.sleep(0.5)
-                except Exception as e:
-                    logging.error(f"Error sending multi-file message {msg_id}: {e}")
-            await callback_query.message.edit_text(f"✅ All {sent_count} videos/files from the bundle have been sent successfully!")
-            
-    else:
-        await callback_query.answer("You have not joined all the channels. Please join them and try again.", show_alert=True)
-        join_buttons = []
-        for channel in missing_channels:
-            join_buttons.append([InlineKeyboardButton(f"🔗 Join @{channel}", url=f"https://t.me/{channel}")])
-        join_buttons.append([InlineKeyboardButton("✅ I Have Joined", callback_data=f"check_join_{file_id_str}")])
-        keyboard = InlineKeyboardMarkup(join_buttons)
-        await callback_query.message.edit_text(
-            f"Please join the remaining channels to continue:",
-            reply_markup=keyboard
-        )
-
-@app.on_callback_query(filters.regex("^(about|help|clone_info|join_channels)$"))
+@app.on_callback_query(filters.regex("^(about|help|join_channels|start_menu)$"))
 async def general_callback_handler(client: Client, callback_query: CallbackQuery):
     query = callback_query.data
     
@@ -359,28 +339,8 @@ async def general_callback_handler(client: Client, callback_query: CallbackQuery
             "4. **Share:** You can share this link with anyone! When they click it, the file(s) will be sent directly to them.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Start", callback_data="start_menu")]])
         )
-    elif query == "clone_info":
-        repo_url = os.environ.get("REPO_URL", "https://github.com/your-username/your-bot-repo")
-        
-        # We'll create a deploy button with pre-filled environment variables.
-        # This requires the repo to have an app.json file for Heroku or an environment variable section in a Render.yaml file.
-        deploy_url = f"https://render.com/deploy?repo={urllib.parse.quote(repo_url)}&env=API_ID={API_ID}&env=API_HASH={API_HASH}&env=MONGO_URI={MONGO_URI}&env=LOG_CHANNEL={LOG_CHANNEL}&env=UPDATE_CHANNELS={','.join(UPDATE_CHANNELS)}&env=ADMINS={ADMINS[0] if ADMINS else ''}"
-        
-        await callback_query.message.edit_text(
-            "➕ **Clone Me!**\n\n"
-            "You can create your very own version of this bot in just one step! Click the button below to deploy this bot to Render or any other hosting platform.\n\n"
-            "**How it works:**\n"
-            "1. Click the 'Deploy Now' button below.\n"
-            "2. You will be redirected to the hosting platform's deployment page with all the necessary settings pre-filled.\n"
-            "3. **Just paste your new Bot Token** and click 'Deploy'.\n\n"
-            "Your new bot will use the same features and configurations as this one. It's that easy! ✨",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Deploy Now", url=deploy_url)],
-                                            [InlineKeyboardButton("🔙 Back to Start", callback_data="start_menu")]])
-        )
     elif query == "join_channels":
-        join_buttons = []
-        for channel in UPDATE_CHANNELS:
-            join_buttons.append([InlineKeyboardButton(f"🔗 Join @{channel}", url=f"https://t.me/{channel}")])
+        join_buttons = [[InlineKeyboardButton(f"🔗 Join @{ch}", url=f"https://t.me/{ch}")] for ch in FORCE_CHANNELS]
         join_buttons.append([InlineKeyboardButton("🔙 Back to Start", callback_data="start_menu")])
         
         await callback_query.message.edit_text(
@@ -391,24 +351,94 @@ async def general_callback_handler(client: Client, callback_query: CallbackQuery
         buttons = [
             [InlineKeyboardButton("📚 About", callback_data="about"),
              InlineKeyboardButton("💡 How to Use?", callback_data="help")],
-            [InlineKeyboardButton("➕ Clone Bot", callback_data="clone_info")],
             [InlineKeyboardButton("🔗 Join Channels", callback_data="join_channels")]
         ]
         await callback_query.message.edit_text(
             f"**Hello, {callback_query.from_user.first_name}! I'm a powerful File-to-Link Bot!** 🤖\n\n"
-            "Just send me any file, or a bundle of files, and I'll give you a **permanent, shareable link** for it. It's fast, secure, and super easy! ✨",
+            "Just send me any file, and I'll give you a **permanent, shareable link** for it. "
+            "It's fast, secure, and super easy! ✨",
             reply_markup=InlineKeyboardMarkup(buttons)
         )
+    await callback_query.answer()
 
-# --- Bot's Main Entry Point ---
+@app.on_callback_query(filters.regex(r"^check_join_"))
+async def check_join_callback(client: Client, callback_query: CallbackQuery):
+    user_id = callback_query.from_user.id
+    file_id_str = callback_query.data.split("_", 2)[2]
+
+    missing_channels = await is_user_member_all_channels(client, user_id, FORCE_CHANNELS)
+    if not missing_channels:
+        await callback_query.answer("Thanks for joining! Sending files now...", show_alert=True)
+        
+        file_record = db.files.find_one({"_id": file_id_str})
+        if file_record:
+            try:
+                await client.copy_message(chat_id=user_id, from_chat_id=LOG_CHANNEL, message_id=file_record['message_id'])
+                await callback_query.message.delete()
+            except Exception as e:
+                await callback_query.message.edit_text(f"❌ An error occurred while sending the file.\n`Error: {e}`")
+        
+        multi_file_record = db.multi_files.find_one({"_id": file_id_str})
+        if multi_file_record:
+            sent_count = 0
+            for msg_id in multi_file_record['message_ids']:
+                try:
+                    await client.copy_message(chat_id=user_id, from_chat_id=LOG_CHANNEL, message_id=msg_id)
+                    sent_count += 1
+                    time.sleep(0.5)
+                except Exception as e:
+                    logging.error(f"Error sending multi-file message {msg_id}: {e}")
+            await callback_query.message.edit_text(f"✅ All {sent_count} files from the bundle have been sent successfully!")
+    else:
+        await callback_query.answer("You have not joined all the channels. Please join them and try again.", show_alert=True)
+        join_buttons = [[InlineKeyboardButton(f"🔗 Join @{ch}", url=f"https://t.me/{ch}")] for ch in missing_channels]
+        join_buttons.append([InlineKeyboardButton("✅ I Have Joined", callback_data=f"check_join_{file_id_str}")])
+        keyboard = InlineKeyboardMarkup(join_buttons)
+        await callback_query.message.edit_text(
+            f"Please join the remaining channels to continue:",
+            reply_markup=keyboard
+        )
+
+@app.on_callback_query(filters.regex(r"^set_mode_"))
+async def set_mode_callback(client: Client, callback_query: CallbackQuery):
+    if callback_query.from_user.id not in ADMINS:
+        await callback_query.answer("Permission Denied!", show_alert=True)
+        return
+        
+    new_mode = callback_query.data.split("_")[2]
+    
+    db.settings.update_one(
+        {"_id": "bot_mode"},
+        {"$set": {"mode": new_mode}},
+        upsert=True
+    )
+    
+    await callback_query.answer(f"Mode successfully set to {new_mode.upper()}!", show_alert=True)
+    
+    public_button = InlineKeyboardButton("🌍 Public (Anyone)", callback_data="set_mode_public")
+    private_button = InlineKeyboardButton("🔒 Private (Admins Only)", callback_data="set_mode_private")
+    keyboard = InlineKeyboardMarkup([[public_button], [private_button]])
+    
+    await callback_query.message.edit_text(
+        f"⚙️ **Bot Settings**\n\n"
+        f"✅ File upload mode is now **{new_mode.upper()}**.\n\n"
+        f"Select a new mode:",
+        reply_markup=keyboard
+    )
+    
+# --- Main Bot Runner ---
 if __name__ == "__main__":
     if not ADMINS:
-        logging.warning("⚠️ WARNING: ADMIN_IDS is not set. The /settings and /multi_link commands will not work.")
-    
+        logging.warning("⚠️ WARNING: ADMINS is not set. Admin commands will not work.")
+    if not FORCE_CHANNELS:
+        logging.warning("⚠️ WARNING: FORCE_CHANNELS is not set. Force join feature will be disabled.")
+        
     logging.info("Starting Flask web server...")
     flask_thread = Thread(target=run_flask)
     flask_thread.start()
     
     logging.info("Bot is starting...")
-    app.run()
+    app.start()
+    idle()
+    app.stop()
     logging.info("Bot has stopped.")
