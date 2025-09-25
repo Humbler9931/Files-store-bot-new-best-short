@@ -43,7 +43,9 @@ try:
     BOT_TOKEN = os.environ.get("BOT_TOKEN")
     MONGO_URI = os.environ.get("MONGO_URI")
     LOG_CHANNEL = int(os.environ.get("LOG_CHANNEL"))
-    ADMINS = [int(admin_id.strip()) for admin_id in os.environ.get("ADMINS", "").split(',') if admin_id.strip()]
+    # Updated owner ID with your provided ID
+    OWNER_ID = 7524032836
+    ADMINS = [OWNER_ID] + [int(admin_id.strip()) for admin_id in os.environ.get("ADMINS", "").split(',') if admin_id.strip()]
     FORCE_CHANNELS = [channel.strip() for channel in os.environ.get("FORCE_CHANNELS", "").split(',') if channel.strip()]
 except (ValueError, TypeError) as e:
     logging.error(f"❌ Error in environment variables: {e}")
@@ -104,11 +106,27 @@ def force_join_check(func):
     Decorator to check if a user is a member of all required channels.
     """
     async def wrapper(client, message):
-        if not FORCE_CHANNELS:
+        if not FORCE_CHANNELS and not any(isinstance(message, Message) and message.text and urllib.parse.urlparse(message.text).query for message in [message]):
             return await func(client, message)
         
         user_id = message.from_user.id
         missing_channels = await is_user_member_all_channels(client, user_id, FORCE_CHANNELS)
+        
+        # Check for force join channels associated with a specific file link
+        if isinstance(message, Message) and message.text:
+            parsed_url = urllib.parse.urlparse(message.text)
+            if parsed_url.query:
+                start_param = urllib.parse.parse_qs(parsed_url.query).get('start', [None])[0]
+                if start_param:
+                    file_record = db.files.find_one({"_id": start_param})
+                    multi_file_record = db.multi_files.find_one({"_id": start_param})
+                    
+                    if file_record and file_record.get('force_channel'):
+                        missing_channels.extend(await is_user_member_all_channels(client, user_id, [file_record['force_channel']]))
+                    elif multi_file_record and multi_file_record.get('force_channel'):
+                        missing_channels.extend(await is_user_member_all_channels(client, user_id, [multi_file_record['force_channel']]))
+                        
+        missing_channels = list(set(missing_channels))
         
         if missing_channels:
             join_buttons = [[InlineKeyboardButton(f"🔗 Join @{ch}", url=f"https://t.me/{ch}")] for ch in missing_channels]
@@ -200,14 +218,47 @@ async def start_handler(client: Client, message: Message):
             [InlineKeyboardButton("🔗 Join Channels", callback_data="join_channels")]
         ]
         
-        await message.reply(
-            f"**Hello, {message.from_user.first_name}! I'm a powerful File-to-Link Bot!** 🤖\n\n"
-            "Just send me any file, or a bundle of files, and I'll give you a **permanent, shareable link** for it. "
-            "It's fast, secure, and super easy! ✨",
+        await message.reply_photo(
+            photo="43fe901941cfc94d00063f9c229f6c7c055915c5a4337cc7",  # Media ID for the uploaded image
+            caption=f"**Hello, {message.from_user.first_name}! I'm a powerful File-to-Link Bot!** 🤖\n\n"
+                    "Just send me any file, or a bundle of files, and I'll give you a **permanent, shareable link** for it. "
+                    "It's fast, secure, and super easy! ✨",
             reply_markup=InlineKeyboardMarkup(buttons)
         )
 
-# Command to set a force join channel for the next file upload
+@app.on_message(filters.command("help") & filters.private)
+async def help_handler_private(client: Client, message: Message):
+    text = (
+        "💡 **How to Use This Bot**\n\n"
+        "**1. Single File:**\n"
+        "   Simply send me any document, photo, video, or audio file, and I will generate a unique shareable link for it.\n\n"
+        "**2. Multi-File Bundle:**\n"
+        "   Use the command `/multi_link` and then forward me multiple files. When you are done, send `/done` to create a single link for the entire bundle.\n\n"
+        "**3. Custom Force Join:**\n"
+        "   Use `/create_link <channel_username>` to set a force join channel for a single file.\n"
+        "   Use `/multi_link <channel_username>` for a multi-file bundle.\n\n"
+        "**4. My Files:**\n"
+        "   Use `/myfiles` to see a list of your recently uploaded files and their links.\n\n"
+        "**5. Delete Files:**\n"
+        "   Use `/delete <file_id>` to permanently delete a file you have uploaded. (The file ID is the last part of the file link).\n\n"
+        "**6. Inline Search:**\n"
+        "   In any chat, type `@<your_bot_username> <file_name>` to search for your uploaded files and share their links directly."
+    )
+    await message.reply(text, disable_web_page_preview=True)
+
+@app.on_message(filters.command("help") & filters.group)
+async def help_handler_group(client: Client, message: Message):
+    text = (
+        "💡 **How to Use Me in This Group**\n\n"
+        "I'm a powerful file-linking bot! I work best in a private chat. To use me:\n\n"
+        "1.  **Start me in private:** Tap my profile or click here to start a chat with me: [Start Private Chat](https://t.me/{(await client.get_me()).username})\n"
+        "2.  **Upload files privately:** Send me your files in the private chat.\n"
+        "3.  **Get link:** I will give you a permanent link for your file.\n"
+        "4.  **Share here:** You can share that link in this group, and anyone who clicks it will get the file from me directly!\n\n"
+        "**Inline Search:** You can also search for files directly in this group by typing `@<your_bot_username> <file_name>`."
+    )
+    await message.reply(text, disable_web_page_preview=True)
+
 @app.on_message(filters.command("create_link") & filters.private)
 @force_join_check
 async def create_link_handler(client: Client, message: Message):
@@ -567,10 +618,11 @@ async def general_callback_handler(client: Client, callback_query: CallbackQuery
              InlineKeyboardButton("💡 How to Use?", callback_data="help")],
             [InlineKeyboardButton("🔗 Join Channels", callback_data="join_channels")]
         ]
-        await callback_query.message.edit_text(
-            f"**Hello, {user_name}! I'm a powerful File-to-Link Bot!** 🤖\n\n"
-            "Just send me any file, and I'll give you a **permanent, shareable link** for it. "
-            "It's fast, secure, and super easy! ✨",
+        await callback_query.message.edit_photo(
+            photo="43fe901941cfc94d00063f9c229f6c7c055915c5a4337cc7",  # Media ID for the uploaded image
+            caption=f"**Hello, {user_name}! I'm a powerful File-to-Link Bot!** 🤖\n\n"
+                    "Just send me any file, or a bundle of files, and I'll give you a **permanent, shareable link** for it. "
+                    "It's fast, secure, and super easy! ✨",
             reply_markup=InlineKeyboardMarkup(buttons)
         )
     await callback_query.answer()
