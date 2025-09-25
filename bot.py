@@ -7,7 +7,7 @@ import urllib.parse
 from dotenv import load_dotenv
 from pyrogram import Client, filters, idle
 from pyrogram.errors import UserNotParticipant
-from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, CallbackQuery
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, CallbackQuery, InlineQueryResultArticle, InputTextMessageContent
 from pymongo import MongoClient
 from flask import Flask
 from threading import Thread
@@ -84,11 +84,35 @@ async def get_bot_mode(db) -> str:
     db.settings.update_one({"_id": "bot_mode"}, {"$set": {"mode": "public"}}, upsert=True)
     return "public"
 
+def force_join_check(func):
+    """
+    Decorator to check if a user is a member of all required channels.
+    """
+    async def wrapper(client, message):
+        if not FORCE_CHANNELS:
+            return await func(client, message)
+        
+        user_id = message.from_user.id
+        missing_channels = await is_user_member_all_channels(client, user_id, FORCE_CHANNELS)
+        
+        if missing_channels:
+            join_buttons = [[InlineKeyboardButton(f"🔗 Join @{ch}", url=f"https://t.me/{ch}")] for ch in missing_channels]
+            join_buttons.append([InlineKeyboardButton("🔄 Try Again", callback_data="check_join_force")])
+            
+            await message.reply(
+                "👋 **Hello!**\n\nTo use this command, you must first join the following channels:",
+                reply_markup=InlineKeyboardMarkup(join_buttons),
+                quote=True
+            )
+            return
+        
+        return await func(client, message)
+    return wrapper
+
 # --- Bot Command Handlers ---
 
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client: Client, message: Message):
-    # Store user in database
     db.users.update_one({"_id": message.from_user.id}, {"$set": {"name": message.from_user.full_name}}, upsert=True)
 
     if len(message.command) > 1:
@@ -164,7 +188,17 @@ async def file_handler(client: Client, message: Message):
     try:
         forwarded_message = await message.forward(LOG_CHANNEL)
         file_id_str = generate_random_string()
-        db.files.insert_one({'_id': file_id_str, 'message_id': forwarded_message.id})
+        
+        file_name = message.document.file_name if message.document else (message.video.file_name if message.video else (message.audio.file_name if message.audio else "Untitled"))
+        
+        db.files.insert_one({
+            '_id': file_id_str,
+            'message_id': forwarded_message.id,
+            'user_id': message.from_user.id,
+            'file_name': file_name,
+            'created_at': time.time()
+        })
+        
         bot_username = (await client.get_me()).username
         share_link = f"https://t.me/{bot_username}?start={file_id_str}"
         
@@ -182,6 +216,7 @@ async def file_handler(client: Client, message: Message):
         await status_msg.edit_text(f"❌ **Error!**\n\nSomething went wrong. Please try again.\n`Details: {e}`")
 
 @app.on_message(filters.command("multi_link") & filters.private)
+@force_join_check
 async def multi_link_handler(client: Client, message: Message):
     if message.from_user.id not in ADMINS:
         await message.reply("❌ This command is for admins only.")
@@ -240,6 +275,28 @@ async def done_handler(client: Client, message: Message):
             await status_msg.edit_text(f"❌ **Error!**\n\nSomething went wrong. Please try again.\n`Details: {e}`")
     else:
         await message.reply("You are not in multi-link mode. Send `/multi_link` to start.")
+
+@app.on_message(filters.command("myfiles") & filters.private)
+async def my_files_handler(client: Client, message: Message):
+    user_id = message.from_user.id
+    user_files = list(db.files.find({"user_id": user_id}).sort("created_at", -1).limit(10))
+    
+    if not user_files:
+        await message.reply("You haven't uploaded any files yet.")
+        return
+
+    text = "📂 **Your Recently Uploaded Files:**\n\n"
+    for i, file_record in enumerate(user_files):
+        file_name = file_record.get('file_name', 'Unnamed File')
+        file_id_str = file_record['_id']
+        bot_username = (await client.get_me()).username
+        share_link = f"https://t.me/{bot_username}?start={file_id_str}"
+        
+        text += f"**{i+1}.** [{file_name}]({share_link})\n"
+        
+    text += "\n_Only your last 10 files are shown._"
+    
+    await message.reply(text, disable_web_page_preview=True)
 
 @app.on_message(filters.command("admin") & filters.private & filters.user(ADMINS))
 async def admin_panel_handler(client: Client, message: Message):
@@ -426,6 +483,53 @@ async def set_mode_callback(client: Client, callback_query: CallbackQuery):
         reply_markup=keyboard
     )
     
+@app.on_inline_query()
+async def inline_search(client, inline_query):
+    query = inline_query.query.strip().lower()
+    
+    if not query:
+        results = [
+            InlineQueryResultArticle(
+                title="Search for a file",
+                description="Type a filename or keyword to find a link.",
+                input_message_content=InputTextMessageContent(
+                    message_text="🤔 Search for a file here!"
+                )
+            )
+        ]
+        await client.answer_inline_query(inline_query.id, results)
+        return
+
+    files_found = db.files.find(
+        {"file_name": {"$regex": query, "$options": "i"}}
+    ).limit(15)
+
+    articles = []
+    bot_username = (await client.get_me()).username
+    
+    for file_record in files_found:
+        file_name = file_record.get('file_name', 'Unnamed File')
+        file_id_str = file_record['_id']
+        share_link = f"https://t.me/{bot_username}?start={file_id_str}"
+        
+        articles.append(
+            InlineQueryResultArticle(
+                title=file_name,
+                description="Click to share the permanent link for this file.",
+                input_message_content=InputTextMessageContent(
+                    message_text=f"🔗 **Here is your file link:** `{share_link}`",
+                    disable_web_page_preview=True
+                ),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Share Link", url=f"https://t.me/share/url?url={share_link}")]])
+            )
+        )
+
+    await client.answer_inline_query(
+        inline_query.id,
+        results=articles,
+        cache_time=5
+    )
+
 # --- Main Bot Runner ---
 if __name__ == "__main__":
     if not ADMINS:
