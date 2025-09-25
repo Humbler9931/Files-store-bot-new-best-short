@@ -3,6 +3,7 @@ import logging
 import random
 import string
 import time
+import asyncio
 import urllib.parse
 from dotenv import load_dotenv
 from pyrogram import Client, filters, idle
@@ -79,6 +80,8 @@ async def get_user_full_name(user):
 
 async def is_user_member_all_channels(client: Client, user_id: int, channels: list) -> list:
     missing_channels = []
+    if not channels:
+        return []
     for channel in channels:
         try:
             await client.get_chat_member(chat_id=f"@{channel}", user_id=user_id)
@@ -121,6 +124,15 @@ def force_join_check(func):
         return await func(client, message)
     return wrapper
 
+async def delete_files_after_delay(client: Client, chat_id: int, message_ids: list):
+    """Deletes a list of messages after a 60-minute delay."""
+    await asyncio.sleep(3600)  # Wait for 60 minutes
+    try:
+        await client.delete_messages(chat_id=chat_id, message_ids=message_ids)
+        logging.info(f"Successfully deleted messages {message_ids} for user {chat_id}.")
+    except Exception as e:
+        logging.error(f"Failed to delete messages {message_ids} for user {chat_id}: {e}")
+
 # --- Bot Command Handlers ---
 
 @app.on_message(filters.command("start") & filters.private)
@@ -131,7 +143,20 @@ async def start_handler(client: Client, message: Message):
     if len(message.command) > 1:
         file_id_str = message.command[1]
         
-        missing_channels = await is_user_member_all_channels(client, message.from_user.id, FORCE_CHANNELS)
+        # Check for force join channels associated with the specific file
+        file_record = db.files.find_one({"_id": file_id_str})
+        multi_file_record = db.multi_files.find_one({"_id": file_id_str})
+        
+        force_channels_for_file = []
+        if file_record and file_record.get('force_channel'):
+            force_channels_for_file.append(file_record['force_channel'])
+        elif multi_file_record and multi_file_record.get('force_channel'):
+            force_channels_for_file.append(multi_file_record['force_channel'])
+        
+        # Add global force channels if any
+        all_channels_to_check = list(set(force_channels_for_file + FORCE_CHANNELS))
+
+        missing_channels = await is_user_member_all_channels(client, message.from_user.id, all_channels_to_check)
         
         if missing_channels:
             join_buttons = [[InlineKeyboardButton(f"🔗 Join @{ch}", url=f"https://t.me/{ch}")] for ch in missing_channels]
@@ -144,25 +169,27 @@ async def start_handler(client: Client, message: Message):
             )
             return
 
-        file_record = db.files.find_one({"_id": file_id_str})
         if file_record:
             try:
-                await client.copy_message(chat_id=message.from_user.id, from_chat_id=LOG_CHANNEL, message_id=file_record['message_id'])
+                sent_message = await client.copy_message(chat_id=message.from_user.id, from_chat_id=LOG_CHANNEL, message_id=file_record['message_id'])
+                # Start timed deletion for the sent message
+                asyncio.create_task(delete_files_after_delay(client, message.from_user.id, [sent_message.id]))
             except Exception as e:
                 await message.reply(f"❌ An error occurred while sending the file.\n`Error: {e}`")
             return
 
-        multi_file_record = db.multi_files.find_one({"_id": file_id_str})
         if multi_file_record:
-            sent_count = 0
+            sent_message_ids = []
             for msg_id in multi_file_record['message_ids']:
                 try:
-                    await client.copy_message(chat_id=message.from_user.id, from_chat_id=LOG_CHANNEL, message_id=msg_id)
-                    sent_count += 1
+                    sent_message = await client.copy_message(chat_id=message.from_user.id, from_chat_id=LOG_CHANNEL, message_id=msg_id)
+                    sent_message_ids.append(sent_message.id)
                     time.sleep(0.5)
                 except Exception as e:
                     logging.error(f"Error sending multi-file message {msg_id}: {e}")
-            await message.reply(f"✅ All {sent_count} files from the bundle have been sent successfully!")
+            await message.reply(f"✅ All {len(sent_message_ids)} files from the bundle have been sent successfully!")
+            # Start timed deletion for the sent messages
+            asyncio.create_task(delete_files_after_delay(client, message.from_user.id, sent_message_ids))
             return
         
         await message.reply("🤔 File or bundle not found! The link might be wrong or expired.")
@@ -180,6 +207,38 @@ async def start_handler(client: Client, message: Message):
             reply_markup=InlineKeyboardMarkup(buttons)
         )
 
+# Command to set a force join channel for the next file upload
+@app.on_message(filters.command("create_link") & filters.private)
+async def create_link_handler(client: Client, message: Message):
+    if len(message.command) < 2:
+        db.settings.update_one(
+            {"_id": message.from_user.id, "type": "temp"},
+            {"$set": {"state": "single_link", "force_channel": None}},
+            upsert=True
+        )
+        await message.reply("Okay! Now send me a single file to generate a link.")
+        return
+        
+    force_channel = message.command[1].replace('@', '').strip()
+    try:
+        chat = await client.get_chat(force_channel)
+        if chat.type != 'channel':
+            await message.reply("❌ That is not a valid public channel username. Please provide a public channel username starting with '@' or just the username.")
+            return
+        
+        await client.get_chat_member(chat_id=f"@{force_channel}", user_id=(await client.get_me()).id)
+        
+        db.settings.update_one(
+            {"_id": message.from_user.id, "type": "temp"},
+            {"$set": {"state": "single_link", "force_channel": force_channel}},
+            upsert=True
+        )
+        
+        await message.reply(f"✅ Force join channel set to **@{force_channel}**. Now send me a file to get its link.")
+        
+    except Exception as e:
+        await message.reply(f"❌ I could not find that channel or I'm not an admin there. Please make sure the channel is public and I have admin rights.\n`Error: {e}`")
+
 @app.on_message(filters.private & (filters.document | filters.video | filters.photo | filters.audio))
 async def file_handler(client: Client, message: Message):
     bot_mode = await get_bot_mode(db)
@@ -188,6 +247,8 @@ async def file_handler(client: Client, message: Message):
         return
 
     user_state = db.settings.find_one({"_id": message.from_user.id, "type": "temp"})
+    
+    # Handle multi_link mode
     if user_state and user_state.get("state") == "multi_link":
         db.settings.update_one(
             {"_id": message.from_user.id, "type": "temp"},
@@ -195,13 +256,13 @@ async def file_handler(client: Client, message: Message):
         )
         await message.reply("File added to bundle. Send more or use `/done` to finish.", quote=True)
         return
-        
+    
     status_msg = await message.reply("⏳ Uploading file... Please wait a moment.", quote=True)
     
     try:
         forwarded_message = await message.forward(LOG_CHANNEL)
         file_id_str = generate_random_string()
-
+        
         # Added File Categorization
         file_name = "Untitled"
         file_type = "unknown"
@@ -218,14 +279,20 @@ async def file_handler(client: Client, message: Message):
             file_name = message.audio.file_name
             file_type = "audio"
 
+        # Check for user-set force channel
+        force_channel = user_state.get("force_channel") if user_state and user_state.get("state") == "single_link" else None
+        
         db.files.insert_one({
             '_id': file_id_str,
             'message_id': forwarded_message.id,
             'user_id': message.from_user.id,
             'file_name': file_name,
             'file_type': file_type,
+            'force_channel': force_channel,
             'created_at': time.time()
         })
+        
+        db.settings.delete_one({"_id": message.from_user.id, "type": "temp"})
         
         bot_username = (await client.get_me()).username
         share_link = f"https://t.me/{bot_username}?start={file_id_str}"
@@ -243,13 +310,33 @@ async def file_handler(client: Client, message: Message):
         logging.error(f"File handling error: {e}")
         await status_msg.edit_text(f"❌ **Error!**\n\nSomething went wrong. Please try again.\n`Details: {e}`")
 
-# Multi-file link command for ALL users
 @app.on_message(filters.command("multi_link") & filters.private)
 @force_join_check
 async def multi_link_handler(client: Client, message: Message):
+    if len(message.command) > 1:
+        force_channel = message.command[1].replace('@', '').strip()
+        try:
+            chat = await client.get_chat(force_channel)
+            if chat.type != 'channel':
+                await message.reply("❌ That is not a valid public channel username. Please provide a public channel username.")
+                return
+            await client.get_chat_member(chat_id=f"@{force_channel}", user_id=(await client.get_me()).id)
+            
+            db.settings.update_one(
+                {"_id": message.from_user.id, "type": "temp"},
+                {"$set": {"state": "multi_link", "message_ids": [], "force_channel": force_channel}},
+                upsert=True
+            )
+            await message.reply(f"✅ Force join channel set to **@{force_channel}**. Now, forward me the files you want to bundle together. When finished, send `/done`.")
+            return
+            
+        except Exception as e:
+            await message.reply(f"❌ I could not find that channel or I'm not an admin there. Please make sure the channel is public and I have admin rights.\n`Error: {e}`")
+            return
+    
     db.settings.update_one(
         {"_id": message.from_user.id, "type": "temp"},
-        {"$set": {"state": "multi_link", "message_ids": []}},
+        {"$set": {"state": "multi_link", "message_ids": [], "force_channel": None}},
         upsert=True
     )
     
@@ -278,7 +365,13 @@ async def done_handler(client: Client, message: Message):
                     logging.error(f"Error forwarding message {msg_id}: {e}")
             
             multi_file_id = generate_random_string(8)
-            db.multi_files.insert_one({'_id': multi_file_id, 'message_ids': forwarded_msg_ids})
+            force_channel = user_state.get("force_channel")
+            db.multi_files.insert_one({
+                '_id': multi_file_id, 
+                'message_ids': forwarded_msg_ids,
+                'force_channel': force_channel,
+                'created_at': time.time()
+            })
             
             bot_username = (await client.get_me()).username
             share_link = f"https://t.me/{bot_username}?start={multi_file_id}"
@@ -484,29 +577,41 @@ async def check_join_callback(client: Client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
     file_id_str = callback_query.data.split("_", 2)[2]
 
-    missing_channels = await is_user_member_all_channels(client, user_id, FORCE_CHANNELS)
+    file_record = db.files.find_one({"_id": file_id_str})
+    multi_file_record = db.multi_files.find_one({"_id": file_id_str})
+
+    force_channels_for_file = []
+    if file_record and file_record.get('force_channel'):
+        force_channels_for_file.append(file_record['force_channel'])
+    elif multi_file_record and multi_file_record.get('force_channel'):
+        force_channels_for_file.append(multi_file_record['force_channel'])
+    
+    all_channels_to_check = list(set(force_channels_for_file + FORCE_CHANNELS))
+    missing_channels = await is_user_member_all_channels(client, user_id, all_channels_to_check)
+
     if not missing_channels:
         await callback_query.answer("Thanks for joining! Sending files now...", show_alert=True)
         
-        file_record = db.files.find_one({"_id": file_id_str})
         if file_record:
             try:
-                await client.copy_message(chat_id=user_id, from_chat_id=LOG_CHANNEL, message_id=file_record['message_id'])
+                sent_message = await client.copy_message(chat_id=user_id, from_chat_id=LOG_CHANNEL, message_id=file_record['message_id'])
                 await callback_query.message.delete()
+                # Start timed deletion for the sent message
+                asyncio.create_task(delete_files_after_delay(client, user_id, [sent_message.id]))
             except Exception as e:
                 await callback_query.message.edit_text(f"❌ An error occurred while sending the file.\n`Error: {e}`")
         
-        multi_file_record = db.multi_files.find_one({"_id": file_id_str})
         if multi_file_record:
-            sent_count = 0
+            sent_message_ids = []
             for msg_id in multi_file_record['message_ids']:
                 try:
-                    await client.copy_message(chat_id=user_id, from_chat_id=LOG_CHANNEL, message_id=msg_id)
-                    sent_count += 1
+                    sent_message = await client.copy_message(chat_id=user_id, from_chat_id=LOG_CHANNEL, message_id=msg_id)
+                    sent_message_ids.append(sent_message.id)
                     time.sleep(0.5)
                 except Exception as e:
                     logging.error(f"Error sending multi-file message {msg_id}: {e}")
-            await callback_query.message.edit_text(f"✅ All {sent_count} files from the bundle have been sent successfully!")
+            await callback_query.message.edit_text(f"✅ All {len(sent_message_ids)} files from the bundle have been sent successfully!")
+            asyncio.create_task(delete_files_after_delay(client, user_id, sent_message_ids))
     else:
         await callback_query.answer("You have not joined all the channels. Please join them and try again.", show_alert=True)
         join_buttons = [[InlineKeyboardButton(f"🔗 Join @{ch}", url=f"https://t.me/{ch}")] for ch in missing_channels]
