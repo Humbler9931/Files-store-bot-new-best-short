@@ -243,13 +243,10 @@ async def file_handler(client: Client, message: Message):
         logging.error(f"File handling error: {e}")
         await status_msg.edit_text(f"❌ **Error!**\n\nSomething went wrong. Please try again.\n`Details: {e}`")
 
+# Multi-file link command for ALL users
 @app.on_message(filters.command("multi_link") & filters.private)
 @force_join_check
 async def multi_link_handler(client: Client, message: Message):
-    if message.from_user.id not in ADMINS:
-        await message.reply("❌ This command is for admins only.")
-        return
-    
     db.settings.update_one(
         {"_id": message.from_user.id, "type": "temp"},
         {"$set": {"state": "multi_link", "message_ids": []}},
