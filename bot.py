@@ -74,7 +74,6 @@ def generate_random_string(length=6):
 async def get_user_full_name(user):
     """Safely gets the user's full name, handling cases where it's not available."""
     if user:
-        # Fixed the logic to safely get the full name
         full_name = user.first_name if user.first_name else ""
         if user.last_name:
             full_name += f" {user.last_name}"
@@ -266,6 +265,7 @@ async def help_handler_group(client: Client, message: Message):
     )
     await message.reply(text, disable_web_page_preview=True)
 
+# Fixed the caption filter error
 @app.on_message(filters.private & filters.user(ADMINS) & filters.photo & filters.caption("set_start_photo"))
 async def set_start_photo_handler(client: Client, message: Message):
     if not message.photo:
