@@ -74,9 +74,11 @@ def generate_random_string(length=6):
 async def get_user_full_name(user):
     """Safely gets the user's full name, handling cases where it's not available."""
     if user:
-        if user.first_name and user.last_name:
-            return f"{user.first_name} {user.last_name}"
-        return user.first_name if user.first_name else f"User_{user.id}"
+        # Fixed the logic to safely get the full name
+        full_name = user.first_name if user.first_name else ""
+        if user.last_name:
+            full_name += f" {user.last_name}"
+        return full_name.strip() if full_name else f"User_{user.id}"
     return "Unknown User"
 
 async def is_user_member_all_channels(client: Client, user_id: int, channels: list) -> list:
