@@ -7,7 +7,7 @@ import asyncio
 import urllib.parse
 from dotenv import load_dotenv
 from pyrogram import Client, filters, idle
-from pyrogram.errors import UserNotParticipant
+from pyrogram.errors import UserNotParticipant, ChatAdminRequired
 from pyrogram.types import (
     InlineKeyboardButton, InlineKeyboardMarkup, Message,
     CallbackQuery, InlineQueryResultArticle,
@@ -17,6 +17,7 @@ from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError
 from flask import Flask
 from threading import Thread
+from datetime import datetime, timedelta
 
 # --- Flask Web Server (To keep the bot alive) ---
 flask_app = Flask(__name__)
@@ -44,9 +45,13 @@ try:
     BOT_TOKEN = os.environ.get("BOT_TOKEN")
     MONGO_URI = os.environ.get("MONGO_URI")
     LOG_CHANNEL = int(os.environ.get("LOG_CHANNEL"))
+    GROUP_LOG_CHANNEL = int(os.environ.get("GROUP_LOG_CHANNEL")) # New log channel for group actions
     OWNER_ID = 7524032836
     ADMINS = [OWNER_ID] + [int(admin_id.strip()) for admin_id in os.environ.get("ADMINS", "").split(',') if admin_id.strip()]
     FORCE_CHANNELS = [channel.strip() for channel in os.environ.get("FORCE_CHANNELS", "").split(',') if channel.strip()]
+    
+    BADWORDS = os.environ.get("BADWORDS", "fuck,bitch,asshole").lower().split(',')
+    MAX_WARNINGS = 3
 except (ValueError, TypeError) as e:
     logging.error(f"❌ Error in environment variables: {e}")
     exit()
@@ -273,7 +278,6 @@ async def help_handler_group(client: Client, message: Message):
     )
     await message.reply(text, disable_web_page_preview=True)
 
-# Corrected caption filter to be a standard filter check
 async def is_set_start_photo(filter, client: Client, message: Message):
     if message.caption and message.caption.strip() == "set_start_photo":
         return True
@@ -821,12 +825,203 @@ async def inline_search(client, inline_query):
         cache_time=5
     )
 
+
+# --- New Group Features ---
+
+@app.on_chat_member_updated(filters.group)
+async def welcome_and_goodbye_messages(client, member):
+    if member.new_chat_member:
+        user = member.new_chat_member.user
+        if not user.is_bot:
+            welcome_text = (
+                f"👋 **Welcome, {await get_user_full_name(user)}!**\n\n"
+                f"We are glad to have you in our group! "
+                f"Please read the rules and enjoy your stay. ✨"
+            )
+            await member.chat.send_message(welcome_text)
+            
+            log_text = (
+                f"👥 **New Member Joined!**\n"
+                f"• **Name:** {await get_user_full_name(user)}\n"
+                f"• **ID:** `{user.id}`\n"
+                f"• **Username:** @{user.username if user.username else 'N/A'}"
+            )
+            await client.send_message(GROUP_LOG_CHANNEL, log_text)
+
+    elif member.old_chat_member and member.old_chat_member.user not in [await client.get_me()]:
+        user = member.old_chat_member.user
+        if not user.is_bot:
+            log_text = (
+                f"🚪 **Member Left!**\n"
+                f"• **Name:** {await get_user_full_name(user)}\n"
+                f"• **ID:** `{user.id}`\n"
+                f"• **Username:** @{user.username if user.username else 'N/A'}"
+            )
+            await client.send_message(GROUP_LOG_CHANNEL, log_text)
+
+
+@app.on_message(filters.group & ~filters.user(ADMINS))
+async def anti_flood_and_link(client: Client, message: Message):
+    if message.entities:
+        for entity in message.entities:
+            if entity.type in ["url", "text_link"]:
+                try:
+                    await message.delete()
+                    await message.reply(
+                        f"🚫 Link from {await get_user_full_name(message.from_user)} removed. Links are not allowed here."
+                    )
+                    
+                    log_text = (
+                        f"🔗 **Link Removed!**\n"
+                        f"• **User:** {await get_user_full_name(message.from_user)} (`{message.from_user.id}`)\n"
+                        f"• **Group:** {message.chat.title} (`{message.chat.id}`)\n"
+                        f"• **Message:** `{message.text}`"
+                    )
+                    await client.send_message(GROUP_LOG_CHANNEL, log_text)
+                    return
+                except ChatAdminRequired:
+                    pass
+
+    # Anti-Badwords Filter
+    text_lower = message.text.lower() if message.text else ""
+    for badword in BADWORDS:
+        if badword in text_lower:
+            try:
+                await message.delete()
+                await message.reply(f"🚫 Please mind your language, {await get_user_full_name(message.from_user)}.")
+                
+                log_text = (
+                    f"🤬 **Badword Removed!**\n"
+                    f"• **User:** {await get_user_full_name(message.from_user)} (`{message.from_user.id}`)\n"
+                    f"• **Group:** {message.chat.title} (`{message.chat.id}`)\n"
+                    f"• **Message:** `{message.text}`"
+                )
+                await client.send_message(GROUP_LOG_CHANNEL, log_text)
+                return
+            except ChatAdminRequired:
+                pass
+
+
+@app.on_message(filters.command("warn") & filters.group & filters.user(ADMINS))
+async def warn_user(client, message):
+    if not message.reply_to_message:
+        await message.reply("Please reply to a user's message to warn them.")
+        return
+
+    target_user = message.reply_to_message.from_user
+    
+    if target_user.id in ADMINS:
+        await message.reply("Cannot warn an admin.")
+        return
+        
+    warnings_record = db.warnings.find_one({"user_id": target_user.id, "chat_id": message.chat.id})
+    if warnings_record:
+        new_warnings = warnings_record['warnings'] + 1
+        db.warnings.update_one({"user_id": target_user.id, "chat_id": message.chat.id}, {"$set": {"warnings": new_warnings}})
+    else:
+        new_warnings = 1
+        db.warnings.insert_one({"user_id": target_user.id, "chat_id": message.chat.id, "warnings": new_warnings})
+    
+    await message.reply(
+        f"⚠️ {await get_user_full_name(target_user)} has been warned. "
+        f"Warnings: **{new_warnings}/{MAX_WARNINGS}**."
+    )
+    
+    log_text = (
+        f"⚠️ **User Warned!**\n"
+        f"• **User:** {await get_user_full_name(target_user)} (`{target_user.id}`)\n"
+        f"• **Admin:** {await get_user_full_name(message.from_user)} (`{message.from_user.id}`)\n"
+        f"• **Group:** {message.chat.title} (`{message.chat.id}`)\n"
+        f"• **New Warnings:** `{new_warnings}`"
+    )
+    await client.send_message(GROUP_LOG_CHANNEL, log_text)
+    
+    if new_warnings >= MAX_WARNINGS:
+        try:
+            await client.restrict_chat_member(message.chat.id, target_user.id, permissions=pyrogram.types.ChatPermissions(can_send_messages=False))
+            db.warnings.delete_one({"user_id": target_user.id, "chat_id": message.chat.id})
+            await message.reply(f"🚫 {await get_user_full_name(target_user)} has received {MAX_WARNINGS} warnings and has been **muted**.")
+            
+            log_text = (
+                f"🚫 **User Muted (Max Warnings)!**\n"
+                f"• **User:** {await get_user_full_name(target_user)} (`{target_user.id}`)\n"
+                f"• **Group:** {message.chat.title} (`{message.chat.id}`)"
+            )
+            await client.send_message(GROUP_LOG_CHANNEL, log_text)
+            
+        except ChatAdminRequired:
+            await message.reply("I need admin rights to mute this user.")
+
+@app.on_message(filters.command("mute") & filters.group & filters.user(ADMINS))
+async def temp_mute(client, message):
+    if not message.reply_to_message:
+        await message.reply("Please reply to a user's message to mute them.")
+        return
+
+    target_user = message.reply_to_message.from_user
+    if target_user.id in ADMINS:
+        await message.reply("Cannot mute an admin.")
+        return
+        
+    try:
+        duration_str = message.command[1]
+        if duration_str.endswith("m"):
+            duration = int(duration_str[:-1])
+            unmute_time = datetime.now() + timedelta(minutes=duration)
+            await client.restrict_chat_member(message.chat.id, target_user.id, permissions=pyrogram.types.ChatPermissions(can_send_messages=False), until_date=unmute_time)
+            await message.reply(f"🔇 {await get_user_full_name(target_user)} has been muted for **{duration} minutes**.")
+            
+            log_text = (
+                f"🔇 **User Muted!**\n"
+                f"• **User:** {await get_user_full_name(target_user)} (`{target_user.id}`)\n"
+                f"• **Admin:** {await get_user_full_name(message.from_user)} (`{message.from_user.id}`)\n"
+                f"• **Group:** {message.chat.title} (`{message.chat.id}`)\n"
+                f"• **Duration:** `{duration} minutes`"
+            )
+            await client.send_message(GROUP_LOG_CHANNEL, log_text)
+
+        else:
+            await message.reply("Invalid duration format. Use `/mute <duration>m` (e.g., `/mute 10m`).")
+
+    except (IndexError, ValueError):
+        await message.reply("Please provide a duration in minutes. Example: `/mute 10m`.")
+    except ChatAdminRequired:
+        await message.reply("I need admin rights to mute this user.")
+
+@app.on_message(filters.command("kick") & filters.group & filters.user(ADMINS))
+async def temp_kick(client, message):
+    if not message.reply_to_message:
+        await message.reply("Please reply to a user's message to kick them.")
+        return
+
+    target_user = message.reply_to_message.from_user
+    if target_user.id in ADMINS:
+        await message.reply("Cannot kick an admin.")
+        return
+        
+    try:
+        await client.kick_chat_member(message.chat.id, target_user.id)
+        await message.reply(f"👢 {await get_user_full_name(target_user)} has been kicked from the group.")
+        
+        log_text = (
+            f"👢 **User Kicked!**\n"
+            f"• **User:** {await get_user_full_name(target_user)} (`{target_user.id}`)\n"
+            f"• **Admin:** {await get_user_full_name(message.from_user)} (`{message.from_user.id}`)\n"
+            f"• **Group:** {message.chat.title} (`{message.chat.id}`)"
+        )
+        await client.send_message(GROUP_LOG_CHANNEL, log_text)
+        
+    except ChatAdminRequired:
+        await message.reply("I need admin rights to kick this user.")
+
 # --- Main Bot Runner ---
 if __name__ == "__main__":
     if not ADMINS:
         logging.warning("⚠️ WARNING: ADMINS is not set. Admin commands will not work.")
     if not FORCE_CHANNELS:
         logging.warning("⚠️ WARNING: FORCE_CHANNELS is not set. Force join feature will be disabled.")
+    if not GROUP_LOG_CHANNEL:
+        logging.warning("⚠️ WARNING: GROUP_LOG_CHANNEL is not set. Group logs will not be saved.")
         
     logging.info("Starting Flask web server...")
     flask_thread = Thread(target=run_flask)
