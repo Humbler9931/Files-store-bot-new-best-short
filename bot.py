@@ -7,7 +7,11 @@ import urllib.parse
 from dotenv import load_dotenv
 from pyrogram import Client, filters, idle
 from pyrogram.errors import UserNotParticipant
-from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, CallbackQuery, InlineQueryResultArticle, InputTextMessageContent
+from pyrogram.types import (
+    InlineKeyboardButton, InlineKeyboardMarkup, Message,
+    CallbackQuery, InlineQueryResultArticle,
+    InputTextMessageContent
+)
 from pymongo import MongoClient
 from flask import Flask
 from threading import Thread
@@ -197,14 +201,29 @@ async def file_handler(client: Client, message: Message):
     try:
         forwarded_message = await message.forward(LOG_CHANNEL)
         file_id_str = generate_random_string()
-        
-        file_name = message.document.file_name if message.document else (message.video.file_name if message.video else (message.audio.file_name if message.audio else "Untitled"))
-        
+
+        # Added File Categorization
+        file_name = "Untitled"
+        file_type = "unknown"
+        if message.document:
+            file_name = message.document.file_name
+            file_type = "document"
+        elif message.video:
+            file_name = message.video.file_name
+            file_type = "video"
+        elif message.photo:
+            file_name = f"photo_{message.photo.file_id}.jpg"
+            file_type = "photo"
+        elif message.audio:
+            file_name = message.audio.file_name
+            file_type = "audio"
+
         db.files.insert_one({
             '_id': file_id_str,
             'message_id': forwarded_message.id,
             'user_id': message.from_user.id,
             'file_name': file_name,
+            'file_type': file_type,
             'created_at': time.time()
         })
         
@@ -307,6 +326,29 @@ async def my_files_handler(client: Client, message: Message):
     
     await message.reply(text, disable_web_page_preview=True)
 
+@app.on_message(filters.command("delete") & filters.private)
+async def delete_file_handler(client: Client, message: Message):
+    if len(message.command) < 2:
+        await message.reply("Please provide the file link or ID to delete. Example: `/delete abcdef`")
+        return
+
+    file_id_str = message.command[1]
+    file_record = db.files.find_one({"_id": file_id_str, "user_id": message.from_user.id})
+
+    if not file_record:
+        await message.reply("🤔 File not found or you don't have permission to delete it.")
+        return
+
+    delete_button = InlineKeyboardButton("Confirm Delete", callback_data=f"confirm_delete_{file_id_str}")
+    cancel_button = InlineKeyboardButton("Cancel", callback_data="cancel_delete")
+    keyboard = InlineKeyboardMarkup([[delete_button, cancel_button]])
+
+    await message.reply(
+        f"Are you sure you want to delete the file **`{file_record.get('file_name', 'Unnamed File')}`**?",
+        reply_markup=keyboard,
+        quote=True
+    )
+
 @app.on_message(filters.command("admin") & filters.private & filters.user(ADMINS))
 async def admin_panel_handler(client: Client, message: Message):
     buttons = [
@@ -326,11 +368,23 @@ async def stats_handler(client: Client, message: Message):
     single_files_count = db.files.count_documents({})
     multi_files_count = db.multi_files.count_documents({})
     
+    # Detailed stats added
+    today_start = time.time() - (24 * 60 * 60)
+    today_users = db.users.count_documents({"name": {"$exists": True}, "name": {"$ne": "Unknown User"}, "created_at": {"$gte": today_start}})
+    today_files = db.files.count_documents({"created_at": {"$gte": today_start}})
+
+    file_types = db.files.aggregate([{"$group": {"_id": "$file_type", "count": {"$sum": 1}}}])
+    file_types_text = "\n".join([f"  • {ft['_id'].capitalize()}: {ft['count']}" for ft in file_types])
+    
     await message.reply(
         f"📊 **Bot Statistics**\n\n"
         f"**👥 Total Users:** `{user_count}`\n"
+        f"**🗓️ Today's Users:** `{today_users}`\n"
         f"**📄 Single Files:** `{single_files_count}`\n"
-        f"**📦 Multi-File Bundles:** `{multi_files_count}`"
+        f"**📦 Multi-File Bundles:** `{multi_files_count}`\n"
+        f"**🗓️ Today's Files:** `{today_files}`\n\n"
+        f"**📁 Files by Type:**\n"
+        f"{file_types_text}"
     )
 
 @app.on_message(filters.command("broadcast") & filters.private & filters.user(ADMINS))
@@ -493,6 +547,37 @@ async def set_mode_callback(client: Client, callback_query: CallbackQuery):
         reply_markup=keyboard
     )
     
+@app.on_callback_query(filters.regex(r"^confirm_delete_"))
+async def confirm_delete_callback(client: Client, callback_query: CallbackQuery):
+    user_id = callback_query.from_user.id
+    file_id_str = callback_query.data.split("_", 2)[2]
+
+    file_record = db.files.find_one({"_id": file_id_str, "user_id": user_id})
+
+    if not file_record:
+        await callback_query.answer("File not found or already deleted.", show_alert=True)
+        await callback_query.message.edit_text("❌ File could not be deleted. It might be a bad link or already gone.")
+        return
+
+    try:
+        # Delete from log channel
+        await client.delete_messages(chat_id=LOG_CHANNEL, message_ids=file_record['message_id'])
+        
+        # Delete from database
+        db.files.delete_one({"_id": file_id_str})
+
+        await callback_query.answer("File deleted successfully!", show_alert=True)
+        await callback_query.message.edit_text("✅ File has been permanently deleted.")
+    except Exception as e:
+        logging.error(f"Failed to delete file {file_id_str}: {e}")
+        await callback_query.answer("An error occurred while deleting the file.", show_alert=True)
+        await callback_query.message.edit_text("❌ An error occurred while trying to delete the file. Please try again later.")
+
+@app.on_callback_query(filters.regex(r"^cancel_delete"))
+async def cancel_delete_callback(client: Client, callback_query: CallbackQuery):
+    await callback_query.answer("Deletion cancelled.", show_alert=True)
+    await callback_query.message.edit_text("🗑️ Deletion cancelled. Your file is safe.")
+
 @app.on_inline_query()
 async def inline_search(client, inline_query):
     query = inline_query.query.strip().lower()
