@@ -65,6 +65,14 @@ app = Client(
 def generate_random_string(length=6):
     return ''.join(random.choices(string.ascii_lowercase + string.digits, k=length))
 
+async def get_user_full_name(user):
+    """Safely gets the user's full name, handling cases where it's not available."""
+    if user:
+        if user.first_name and user.last_name:
+            return f"{user.first_name} {user.last_name}"
+        return user.first_name if user.first_name else f"User_{user.id}"
+    return "Unknown User"
+
 async def is_user_member_all_channels(client: Client, user_id: int, channels: list) -> list:
     missing_channels = []
     for channel in channels:
@@ -113,7 +121,8 @@ def force_join_check(func):
 
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client: Client, message: Message):
-    db.users.update_one({"_id": message.from_user.id}, {"$set": {"name": message.from_user.full_name}}, upsert=True)
+    user_name = await get_user_full_name(message.from_user)
+    db.users.update_one({"_id": message.from_user.id}, {"$set": {"name": user_name}}, upsert=True)
 
     if len(message.command) > 1:
         file_id_str = message.command[1]
@@ -125,7 +134,7 @@ async def start_handler(client: Client, message: Message):
             join_buttons.append([InlineKeyboardButton("✅ I Have Joined", callback_data=f"check_join_{file_id_str}")])
 
             await message.reply(
-                f"👋 **Hello, {message.from_user.first_name}!**\n\nTo access this file, you must first join the following channels:",
+                f"👋 **Hello, {user_name}!**\n\nTo access this file, you must first join the following channels:",
                 reply_markup=InlineKeyboardMarkup(join_buttons),
                 quote=True
             )
@@ -405,13 +414,14 @@ async def general_callback_handler(client: Client, callback_query: CallbackQuery
             reply_markup=InlineKeyboardMarkup(join_buttons)
         )
     elif query == "start_menu":
+        user_name = await get_user_full_name(callback_query.from_user)
         buttons = [
             [InlineKeyboardButton("📚 About", callback_data="about"),
              InlineKeyboardButton("💡 How to Use?", callback_data="help")],
             [InlineKeyboardButton("🔗 Join Channels", callback_data="join_channels")]
         ]
         await callback_query.message.edit_text(
-            f"**Hello, {callback_query.from_user.first_name}! I'm a powerful File-to-Link Bot!** 🤖\n\n"
+            f"**Hello, {user_name}! I'm a powerful File-to-Link Bot!** 🤖\n\n"
             "Just send me any file, and I'll give you a **permanent, shareable link** for it. "
             "It's fast, secure, and super easy! ✨",
             reply_markup=InlineKeyboardMarkup(buttons)
