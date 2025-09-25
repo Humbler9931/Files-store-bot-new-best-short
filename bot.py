@@ -209,6 +209,7 @@ async def start_handler(client: Client, message: Message):
 
 # Command to set a force join channel for the next file upload
 @app.on_message(filters.command("create_link") & filters.private)
+@force_join_check
 async def create_link_handler(client: Client, message: Message):
     if len(message.command) < 2:
         db.settings.update_one(
@@ -240,6 +241,7 @@ async def create_link_handler(client: Client, message: Message):
         await message.reply(f"❌ I could not find that channel or I'm not an admin there. Please make sure the channel is public and I have admin rights.\n`Error: {e}`")
 
 @app.on_message(filters.private & (filters.document | filters.video | filters.photo | filters.audio))
+@force_join_check
 async def file_handler(client: Client, message: Message):
     bot_mode = await get_bot_mode(db)
     if bot_mode == "private" and message.from_user.id not in ADMINS:
@@ -343,6 +345,7 @@ async def multi_link_handler(client: Client, message: Message):
     await message.reply("Okay! Now, forward me the files you want to bundle together. When you're finished, send the command `/done`.")
 
 @app.on_message(filters.command("done") & filters.private)
+@force_join_check
 async def done_handler(client: Client, message: Message):
     user_id = message.from_user.id
     user_state = db.settings.find_one({"_id": user_id, "type": "temp"})
@@ -460,7 +463,7 @@ async def stats_handler(client: Client, message: Message):
     
     # Detailed stats added
     today_start = time.time() - (24 * 60 * 60)
-    today_users = db.users.count_documents({"name": {"$exists": True}, "name": {"$ne": "Unknown User"}, "created_at": {"$gte": today_start}})
+    today_users = db.users.count_documents({"created_at": {"$gte": today_start}})
     today_files = db.files.count_documents({"created_at": {"$gte": today_start}})
 
     file_types = db.files.aggregate([{"$group": {"_id": "$file_type", "count": {"$sum": 1}}}])
