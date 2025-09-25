@@ -14,6 +14,7 @@ from pyrogram.types import (
     InputTextMessageContent
 )
 from pymongo import MongoClient
+from pymongo.errors import DuplicateKeyError
 from flask import Flask
 from threading import Thread
 
@@ -70,6 +71,13 @@ app = Client(
 # --- Helper Functions ---
 def generate_random_string(length=6):
     return ''.join(random.choices(string.ascii_lowercase + string.digits, k=length))
+
+async def get_unique_id(collection):
+    """Generates a unique ID and checks if it exists in the collection to avoid DuplicateKeyError."""
+    while True:
+        random_id = generate_random_string()
+        if collection.find_one({"_id": random_id}) is None:
+            return random_id
 
 async def get_user_full_name(user):
     """Safely gets the user's full name, handling cases where it's not available."""
@@ -265,8 +273,13 @@ async def help_handler_group(client: Client, message: Message):
     )
     await message.reply(text, disable_web_page_preview=True)
 
-# Fixed the caption filter error
-@app.on_message(filters.private & filters.user(ADMINS) & filters.photo & filters.caption("set_start_photo"))
+# Corrected caption filter to be a standard filter check
+async def is_set_start_photo(filter, client: Client, message: Message):
+    if message.caption and message.caption.strip() == "set_start_photo":
+        return True
+    return False
+
+@app.on_message(filters.private & filters.user(ADMINS) & filters.photo & is_set_start_photo)
 async def set_start_photo_handler(client: Client, message: Message):
     if not message.photo:
         await message.reply("Please send a photo with the caption 'set_start_photo' to set it as the start photo.")
@@ -334,7 +347,7 @@ async def file_handler(client: Client, message: Message):
     
     try:
         forwarded_message = await message.forward(LOG_CHANNEL)
-        file_id_str = generate_random_string()
+        file_id_str = await get_unique_id(db.files) # Use the new function to get a unique ID
         
         file_name = "Untitled"
         file_type = "unknown"
@@ -436,7 +449,7 @@ async def done_handler(client: Client, message: Message):
                 except Exception as e:
                     logging.error(f"Error forwarding message {msg_id}: {e}")
             
-            multi_file_id = generate_random_string(8)
+            multi_file_id = await get_unique_id(db.multi_files) # Use the new function to get a unique ID
             force_channel = user_state.get("force_channel")
             db.multi_files.insert_one({
                 '_id': multi_file_id, 
