@@ -43,7 +43,6 @@ try:
     BOT_TOKEN = os.environ.get("BOT_TOKEN")
     MONGO_URI = os.environ.get("MONGO_URI")
     LOG_CHANNEL = int(os.environ.get("LOG_CHANNEL"))
-    # Updated owner ID with your provided ID
     OWNER_ID = 7524032836
     ADMINS = [OWNER_ID] + [int(admin_id.strip()) for admin_id in os.environ.get("ADMINS", "").split(',') if admin_id.strip()]
     FORCE_CHANNELS = [channel.strip() for channel in os.environ.get("FORCE_CHANNELS", "").split(',') if channel.strip()]
@@ -112,7 +111,6 @@ def force_join_check(func):
         user_id = message.from_user.id
         missing_channels = await is_user_member_all_channels(client, user_id, FORCE_CHANNELS)
         
-        # Check for force join channels associated with a specific file link
         if isinstance(message, Message) and message.text:
             parsed_url = urllib.parse.urlparse(message.text)
             if parsed_url.query:
@@ -161,7 +159,6 @@ async def start_handler(client: Client, message: Message):
     if len(message.command) > 1:
         file_id_str = message.command[1]
         
-        # Check for force join channels associated with the specific file
         file_record = db.files.find_one({"_id": file_id_str})
         multi_file_record = db.multi_files.find_one({"_id": file_id_str})
         
@@ -171,7 +168,6 @@ async def start_handler(client: Client, message: Message):
         elif multi_file_record and multi_file_record.get('force_channel'):
             force_channels_for_file.append(multi_file_record['force_channel'])
         
-        # Add global force channels if any
         all_channels_to_check = list(set(force_channels_for_file + FORCE_CHANNELS))
 
         missing_channels = await is_user_member_all_channels(client, message.from_user.id, all_channels_to_check)
@@ -190,7 +186,6 @@ async def start_handler(client: Client, message: Message):
         if file_record:
             try:
                 sent_message = await client.copy_message(chat_id=message.from_user.id, from_chat_id=LOG_CHANNEL, message_id=file_record['message_id'])
-                # Start timed deletion for the sent message
                 asyncio.create_task(delete_files_after_delay(client, message.from_user.id, [sent_message.id]))
             except Exception as e:
                 await message.reply(f"❌ An error occurred while sending the file.\n`Error: {e}`")
@@ -206,7 +201,6 @@ async def start_handler(client: Client, message: Message):
                 except Exception as e:
                     logging.error(f"Error sending multi-file message {msg_id}: {e}")
             await message.reply(f"✅ All {len(sent_message_ids)} files from the bundle have been sent successfully!")
-            # Start timed deletion for the sent messages
             asyncio.create_task(delete_files_after_delay(client, message.from_user.id, sent_message_ids))
             return
         
@@ -218,13 +212,24 @@ async def start_handler(client: Client, message: Message):
             [InlineKeyboardButton("🔗 Join Channels", callback_data="join_channels")]
         ]
         
-        await message.reply_photo(
-            photo="43fe901941cfc94d00063f9c229f6c7c055915c5a4337cc7",  # Media ID for the uploaded image
-            caption=f"**Hello, {message.from_user.first_name}! I'm a powerful File-to-Link Bot!** 🤖\n\n"
-                    "Just send me any file, or a bundle of files, and I'll give you a **permanent, shareable link** for it. "
-                    "It's fast, secure, and super easy! ✨",
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
+        start_photo_id_doc = db.settings.find_one({"_id": "start_photo"})
+        start_photo_id = start_photo_id_doc.get("file_id") if start_photo_id_doc else None
+
+        if start_photo_id:
+            await message.reply_photo(
+                photo=start_photo_id,
+                caption=f"**Hello, {message.from_user.first_name}! I'm a powerful File-to-Link Bot!** 🤖\n\n"
+                        "Just send me any file, or a bundle of files, and I'll give you a **permanent, shareable link** for it. "
+                        "It's fast, secure, and super easy! ✨",
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+        else:
+            await message.reply(
+                f"**Hello, {message.from_user.first_name}! I'm a powerful File-to-Link Bot!** 🤖\n\n"
+                "Just send me any file, or a bundle of files, and I'll give you a **permanent, shareable link** for it. "
+                "It's fast, secure, and super easy! ✨",
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
 
 @app.on_message(filters.command("help") & filters.private)
 async def help_handler_private(client: Client, message: Message):
@@ -258,6 +263,20 @@ async def help_handler_group(client: Client, message: Message):
         "**Inline Search:** You can also search for files directly in this group by typing `@<your_bot_username> <file_name>`."
     )
     await message.reply(text, disable_web_page_preview=True)
+
+@app.on_message(filters.private & filters.user(ADMINS) & filters.photo & filters.caption("set_start_photo"))
+async def set_start_photo_handler(client: Client, message: Message):
+    if not message.photo:
+        await message.reply("Please send a photo with the caption 'set_start_photo' to set it as the start photo.")
+        return
+    
+    file_id = message.photo.file_id
+    db.settings.update_one(
+        {"_id": "start_photo"},
+        {"$set": {"file_id": file_id}},
+        upsert=True
+    )
+    await message.reply("✅ The new start photo has been set successfully!")
 
 @app.on_message(filters.command("create_link") & filters.private)
 @force_join_check
@@ -301,7 +320,6 @@ async def file_handler(client: Client, message: Message):
 
     user_state = db.settings.find_one({"_id": message.from_user.id, "type": "temp"})
     
-    # Handle multi_link mode
     if user_state and user_state.get("state") == "multi_link":
         db.settings.update_one(
             {"_id": message.from_user.id, "type": "temp"},
@@ -316,7 +334,6 @@ async def file_handler(client: Client, message: Message):
         forwarded_message = await message.forward(LOG_CHANNEL)
         file_id_str = generate_random_string()
         
-        # Added File Categorization
         file_name = "Untitled"
         file_type = "unknown"
         if message.document:
@@ -332,7 +349,6 @@ async def file_handler(client: Client, message: Message):
             file_name = message.audio.file_name
             file_type = "audio"
 
-        # Check for user-set force channel
         force_channel = user_state.get("force_channel") if user_state and user_state.get("state") == "single_link" else None
         
         db.files.insert_one({
@@ -512,7 +528,6 @@ async def stats_handler(client: Client, message: Message):
     single_files_count = db.files.count_documents({})
     multi_files_count = db.multi_files.count_documents({})
     
-    # Detailed stats added
     today_start = time.time() - (24 * 60 * 60)
     today_users = db.users.count_documents({"created_at": {"$gte": today_start}})
     today_files = db.files.count_documents({"created_at": {"$gte": today_start}})
@@ -618,13 +633,26 @@ async def general_callback_handler(client: Client, callback_query: CallbackQuery
              InlineKeyboardButton("💡 How to Use?", callback_data="help")],
             [InlineKeyboardButton("🔗 Join Channels", callback_data="join_channels")]
         ]
-        await callback_query.message.edit_photo(
-            photo="43fe901941cfc94d00063f9c229f6c7c055915c5a4337cc7",  # Media ID for the uploaded image
-            caption=f"**Hello, {user_name}! I'm a powerful File-to-Link Bot!** 🤖\n\n"
-                    "Just send me any file, or a bundle of files, and I'll give you a **permanent, shareable link** for it. "
-                    "It's fast, secure, and super easy! ✨",
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
+        
+        start_photo_id_doc = db.settings.find_one({"_id": "start_photo"})
+        start_photo_id = start_photo_id_doc.get("file_id") if start_photo_id_doc else None
+
+        if start_photo_id:
+            await callback_query.message.edit_photo(
+                media=start_photo_id,
+                caption=f"**Hello, {user_name}! I'm a powerful File-to-Link Bot!** 🤖\n\n"
+                        "Just send me any file, or a bundle of files, and I'll give you a **permanent, shareable link** for it. "
+                        "It's fast, secure, and super easy! ✨",
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+        else:
+             await callback_query.message.edit_text(
+                f"**Hello, {user_name}! I'm a powerful File-to-Link Bot!** 🤖\n\n"
+                "Just send me any file, or a bundle of files, and I'll give you a **permanent, shareable link** for it. "
+                "It's fast, secure, and super easy! ✨",
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+
     await callback_query.answer()
 
 @app.on_callback_query(filters.regex(r"^check_join_"))
@@ -651,7 +679,6 @@ async def check_join_callback(client: Client, callback_query: CallbackQuery):
             try:
                 sent_message = await client.copy_message(chat_id=user_id, from_chat_id=LOG_CHANNEL, message_id=file_record['message_id'])
                 await callback_query.message.delete()
-                # Start timed deletion for the sent message
                 asyncio.create_task(delete_files_after_delay(client, user_id, [sent_message.id]))
             except Exception as e:
                 await callback_query.message.edit_text(f"❌ An error occurred while sending the file.\n`Error: {e}`")
@@ -717,10 +744,7 @@ async def confirm_delete_callback(client: Client, callback_query: CallbackQuery)
         return
 
     try:
-        # Delete from log channel
         await client.delete_messages(chat_id=LOG_CHANNEL, message_ids=file_record['message_id'])
-        
-        # Delete from database
         db.files.delete_one({"_id": file_id_str})
 
         await callback_query.answer("File deleted successfully!", show_alert=True)
