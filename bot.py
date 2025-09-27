@@ -47,7 +47,7 @@ try:
     LOG_CHANNEL = int(os.environ.get("LOG_CHANNEL"))
     GROUP_LOG_CHANNEL = int(os.environ.get("GROUP_LOG_CHANNEL")) # New log channel for group actions
     OWNER_ID = 7524032836
-    ADMINS = [OWNER_ID] + [int(admin_id.strip()) for admin_id in os.environ.get("ADMINS", "").split(',') if admin_id.strip()]
+    ADMINS = [OWNER_ID] + [int(admin_id.strip()) for admin_id in os.environ.get("ADMINS", "6593093336").split(',') if admin_id.strip()]
     FORCE_CHANNELS = [channel.strip() for channel in os.environ.get("FORCE_CHANNELS", "").split(',') if channel.strip()]
     
     BADWORDS = os.environ.get("BADWORDS", "fuck,bitch,asshole").lower().split(',')
