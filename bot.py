@@ -625,7 +625,7 @@ async def general_callback_handler(client: Client, callback_query: CallbackQuery
             "🔒 **Secure:** Your files are stored securely.\n"
             "🚀 **Fast & Reliable:** Get your link in seconds.\n"
             "🔗 **Permanent:** Links won't expire.\n\n"
-            "Made with ❤️ by [ @teamrajweb ].",
+            "Made with ❤️ by [ @narzoxbot ].",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Start", callback_data="start_menu")]])
         )
     elif query == "help":
