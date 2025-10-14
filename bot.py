@@ -1240,10 +1240,6 @@ async def welcome_and_goodbye_messages(client: Client, member: Message):
         await client.send_message(GROUP_LOG_CHANNEL, log_text)
 
 
-@app.on_message(filters.group & ~filters.user(ADMINS) & ~filters.edited)
-async def anti_flood_and_link(client: Client, message: Message):
-    """Group message moderator: Anti-Link and Anti-Badwords."""
-    if not message.text and not message.caption: return
 
     # Anti-Link Filter
     text_with_caption = message.text or message.caption
