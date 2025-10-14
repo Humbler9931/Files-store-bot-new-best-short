@@ -344,16 +344,6 @@ async def help_handler_group(client: Client, message: Message):
     )
     await message.reply(text, disable_web_page_preview=True)
 
-@app.on_message(filters.private & filters.user(ADMINS) & filters.photo & filters.caption("set_start_photo", prefixes="/"))
-async def set_start_photo_handler(client: Client, message: Message):
-    """Sets a new photo for the /start command."""
-    file_id = message.photo.file_id
-    db.settings.update_one(
-        {"_id": "start_photo"},
-        {"$set": {"file_id": file_id}},
-        upsert=True
-    )
-    await message.reply("✅ The new **start photo** has been set successfully!")
 
 @app.on_message(filters.command("create_link") & filters.private)
 @force_join_check
