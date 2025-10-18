@@ -57,7 +57,7 @@ try:
     
     FORCE_CHANNELS = [channel.strip() for channel in os.environ.get("FORCE_CHANNELS", "").split(',') if channel.strip()]
     
-    BADWORDS = [word.strip() for word in os.environ.get("BADWORDS", "fuck,bitch,asshole").lower().split(',') if word.strip()]
+    BADWORDS = [word.strip() for word in os.environ.get("BADWORDS", "fuck,bitch,asshole,randi,madarchod").lower().split(',') if word.strip()]
     MAX_WARNINGS = int(os.environ.get("MAX_WARNINGS", 3))
     
 except (ValueError, TypeError) as e:
@@ -155,13 +155,15 @@ def force_join_check(func):
         if isinstance(message, Message) and message.text:
             parsed_url = urllib.parse.urlparse(message.text)
             if parsed_url.query:
+                # Check for /start deep link
                 file_id_str = urllib.parse.parse_qs(parsed_url.query).get('start', [None])[0]
         
-        # Also check for direct command parameter for /create_link or /multi_link
-        if isinstance(message, Message) and message.command and len(message.command) > 1 and message.command[0] in ["create_link", "multi_link", "set_thumbnail"]:
-             # Do not apply force join check on the command itself, let the command handler check the channel
-             pass
-        elif file_id_str:
+        # Also check for direct command parameter for /start
+        if isinstance(message, Message) and message.command and len(message.command) > 1 and message.command[0] in ["start"]:
+             file_id_str = message.command[1]
+
+        # Note: /create_link and /multi_link are handled within their respective handlers
+        if file_id_str and file_id_str != 'force': # 'force' is a generic check fallback
             file_record = db.files.find_one({"_id": file_id_str})
             multi_file_record = db.multi_files.find_one({"_id": file_id_str})
             
@@ -181,7 +183,7 @@ def force_join_check(func):
             
             await message.reply(
                 "🛑 **ACCESS DENIED** 🛑\n\n"
-                "To use this feature, you must first join the following required channels:",
+                "To access this file/feature, you must first join the following required channels:",
                 reply_markup=InlineKeyboardMarkup(join_buttons),
                 quote=True
             )
@@ -211,6 +213,7 @@ async def delete_files_after_delay(client: Client, chat_id: int, message_ids: li
 # --- Bot Command Handlers (Updated for Style and Logic) ---
 
 @app.on_message(filters.command("start") & filters.private)
+@force_join_check # Force join check is now applied directly to /start
 async def start_handler(client: Client, message: Message):
     user_id = message.from_user.id
     user_name = await get_user_full_name(message.from_user)
@@ -228,30 +231,7 @@ async def start_handler(client: Client, message: Message):
         file_record = db.files.find_one({"_id": file_id_str})
         multi_file_record = db.multi_files.find_one({"_id": file_id_str})
         
-        # Check all required channels (global + file-specific)
-        force_channels_for_file = []
-        if file_record and file_record.get('force_channel'):
-            force_channels_for_file.append(file_record['force_channel'])
-        elif multi_file_record and multi_file_record.get('force_channel'):
-            force_channels_for_file.append(multi_file_record['force_channel'])
-        
-        all_channels_to_check = list(set(force_channels_for_file + FORCE_CHANNELS))
-
-        missing_channels = await is_user_member_all_channels(client, user_id, all_channels_to_check)
-        
-        if missing_channels:
-            join_buttons = [[InlineKeyboardButton(f"🔗 Join @{ch}", url=f"https://t.me/{ch}")] for ch in missing_channels]
-            join_buttons.append([InlineKeyboardButton("✅ I Have Joined! (Try Again)", callback_data=f"check_join_{file_id_str}")])
-
-            await message.reply(
-                f"👋 **Hello, {message.from_user.first_name}!**\n\n"
-                "To unlock the file, you must first join the following required channels:",
-                reply_markup=InlineKeyboardMarkup(join_buttons),
-                quote=True
-            )
-            return
-
-        # If user is a member, send the file(s)
+        # If force_join_check passed, send the file(s)
         if file_record:
             try:
                 sent_message = await client.copy_message(chat_id=user_id, from_chat_id=LOG_CHANNEL, message_id=file_record['message_id'])
@@ -289,7 +269,7 @@ async def start_handler(client: Client, message: Message):
         ]
         
         start_photo_id_doc = db.settings.find_one({"_id": "start_photo"})
-        start_photo_id = start_photo_id_doc.get("file_id") if start_photo_id_doc else None
+        start_photo_id = start_photo_id_doc.get("file_id") if start_photo_id_doc and start_photo_id_doc.get("file_id") else None
 
         caption_text = (
             f"**Hello, {message.from_user.first_name}! I'm FileLinker Bot!** 🤖\n\n"
@@ -297,17 +277,25 @@ async def start_handler(client: Client, message: Message):
             " Just send me a file or start a bundle with `/multi_link`! ✨"
         )
         
-        if start_photo_id:
-            await message.reply_photo(
-                photo=start_photo_id,
-                caption=caption_text,
-                reply_markup=InlineKeyboardMarkup(buttons)
-            )
-        else:
-            await message.reply(
-                caption_text,
-                reply_markup=InlineKeyboardMarkup(buttons)
-            )
+        try:
+            if start_photo_id:
+                await message.reply_photo(
+                    photo=start_photo_id,
+                    caption=caption_text,
+                    reply_markup=InlineKeyboardMarkup(buttons)
+                )
+            else:
+                await message.reply(
+                    caption_text,
+                    reply_markup=InlineKeyboardMarkup(buttons)
+                )
+        except Exception:
+             # Fallback to text if photo fails
+             await message.reply(
+                 caption_text,
+                 reply_markup=InlineKeyboardMarkup(buttons)
+             )
+
 
 @app.on_message(filters.command("help") & filters.private)
 async def help_handler_private(client: Client, message: Message):
@@ -315,14 +303,14 @@ async def help_handler_private(client: Client, message: Message):
         "💡 **FileLinker Bot Usage Guide**\n\n"
         "**1. Single File Link:**\n"
         "   - Send me any file (document, video, photo, audio).\n"
-        "   - **Custom Force Join:** Use `/create_link <channel_username>` then send the file.\n\n"
+        "   - **Custom Force Join:** Use `/create_link @channel_username [Title]` then send the file.\n\n"
         "**2. Multi-File Bundle Link:**\n"
         "   - Start the bundle: `/multi_link [Title for bundle]`\n"
         "   - Forward all your files to me.\n"
         "   - Finish: Send `/done`.\n"
-        "   - **Custom Force Join:** Use `/multi_link <channel_username> [Title]`\n\n"
+        "   - **Custom Force Join:** Use `/multi_link @channel_username [Title]`\n\n"
         "**3. Set Thumbnail (New! 🖼️):**\n"
-        "   - Reply to a photo with: `/set_thumbnail`\n"
+        "   - Reply to a **photo** with: `/set_thumbnail`\n"
         "   - The next file or bundle will use that photo as its thumbnail.\n\n"
         "**4. Management:**\n"
         "   - **My Files:** `/myfiles` (View your last 10 uploads).\n"
@@ -332,33 +320,18 @@ async def help_handler_private(client: Client, message: Message):
     )
     await message.reply(text, disable_web_page_preview=True)
 
-@app.on_message(filters.command("help") & filters.group)
-async def help_handler_group(client: Client, message: Message):
-    text = (
-        "💡 **How to Use Me in This Group**\n\n"
-        "I'm a file-linking bot! My primary function is in private chat. To share files:\n\n"
-        "1.  **Start Private Chat:** Click here: [Start FileLinker Bot](https://t.me/{(await client.get_me()).username})\n"
-        "2.  **Upload/Bundle Files:** Send me your files in private chat to get a permanent link.\n"
-        "3.  **Share the Link:** Post the link in this group.\n\n"
-        "**Inline Search:** You can search for files directly here by typing `@{(await client.get_me()).username} <file_name>`."
-    )
-    await message.reply(text, disable_web_page_preview=True)
-
+# Note: Group Help Handler removed as per request
 
 @app.on_message(filters.command("create_link") & filters.private)
 @force_join_check
 async def create_link_handler(client: Client, message: Message):
-    if len(message.command) < 2 or (len(message.command) == 2 and not message.command[1].startswith('@')):
-        # Only command or command with a title
+    # Check for state clearance for custom name/channel
+    if len(message.command) == 1 or (len(message.command) > 1 and not message.command[1].startswith('@')):
+        # Only command or command with a title (no channel specified)
         force_channel = None
+        file_name = " ".join(message.command[1:]) if len(message.command) > 1 else None
         
-        # If there's a title, save it
-        if len(message.command) > 1 and not message.command[1].startswith('@'):
-            file_name = " ".join(message.command[1:])
-        else:
-            file_name = None
-            
-        # Preserve thumbnail ID if it exists
+        # Preserve existing thumbnail ID
         user_state = db.settings.find_one({"_id": message.from_user.id, "type": "temp_link"})
         thumbnail_id = user_state.get("thumbnail_id") if user_state else None
             
@@ -370,9 +343,14 @@ async def create_link_handler(client: Client, message: Message):
         await message.reply("Okay! Now send me a **single file** to generate a link.")
         return
         
-    # Command with a channel username
-    force_channel = message.command[1].replace('@', '').strip()
-    file_name = " ".join(message.command[2:]) if len(message.command) > 2 else None
+    # Command with a channel username (must start with @)
+    channel_index = 1
+    if not message.command[channel_index].startswith('@'):
+         # If the first argument does not start with @, it's a file name, proceed without channel check
+         return await create_link_handler(client, message)
+         
+    force_channel = message.command[channel_index].replace('@', '').strip()
+    file_name = " ".join(message.command[channel_index+1:]) if len(message.command) > channel_index+1 else None
     
     try:
         chat = await client.get_chat(force_channel)
@@ -383,7 +361,7 @@ async def create_link_handler(client: Client, message: Message):
         # Bot must be a member
         await client.get_chat_member(chat_id=f"@{force_channel}", user_id=(await client.get_me()).id)
         
-        # Preserve thumbnail ID if it exists
+        # Preserve existing thumbnail ID
         user_state = db.settings.find_one({"_id": message.from_user.id, "type": "temp_link"})
         thumbnail_id = user_state.get("thumbnail_id") if user_state else None
         
@@ -409,9 +387,8 @@ async def set_thumbnail_handler(client: Client, message: Message):
     # Check if a photo is replied to or sent with the command
     if not message.reply_to_message or not message.reply_to_message.photo:
         await message.reply(
-            "🖼️ **थंबनेल सेट करें**\n\n"
-            "कृपया उस **फोटो** पर रिप्लाई (reply) करें जिसे आप अगले अपलोड के लिए थंबनेल के रूप में उपयोग करना चाहते हैं।\n"
-            "फिर `/set_thumbnail` भेजें।"
+            "🖼️ **Set Thumbnail**\n\n"
+            "Please **reply** to the **photo** you wish to use as a thumbnail for your next upload/bundle, and then send `/set_thumbnail`."
         )
         return
         
@@ -425,8 +402,24 @@ async def set_thumbnail_handler(client: Client, message: Message):
         upsert=True
     )
     
-    await message.reply("✅ **थंबनेल सेट हो गया!**\n\n"
-                        "अगली फ़ाइल जो आप भेजेंगे (या अगले `/multi_link` बंडल) में यही थंबनेल इस्तेमाल होगा।")
+    await message.reply("✅ **Thumbnail Set!**\n\n"
+                        "The next file you upload (or the next `/multi_link` bundle) will use this thumbnail. Send `/cancel_thumbnail` to remove it.")
+                        
+@app.on_message(filters.command("cancel_thumbnail") & filters.private)
+@force_join_check
+async def cancel_thumbnail_handler(client: Client, message: Message):
+    """Cancels the temporary thumbnail."""
+    
+    # Find and unset the thumbnail ID
+    result = db.settings.update_one(
+        {"_id": message.from_user.id, "type": "temp_link"},
+        {"$unset": {"thumbnail_id": ""}}
+    )
+    
+    if result.modified_count > 0:
+         await message.reply("✅ **Custom Thumbnail Cancelled!** Future uploads will use default thumbnails.")
+    else:
+         await message.reply("❌ No custom thumbnail was set to be cancelled.")
 # ---------------------------------
 
 @app.on_message(filters.private & (filters.document | filters.video | filters.photo | filters.audio))
@@ -446,21 +439,20 @@ async def file_handler(client: Client, message: Message):
     if user_state and user_state.get("state") == "multi_link":
         
         # Check if the file is too large for the bot to handle (Pyrogram limit or custom limit)
-        if message.video and message.video.file_size > (2 * 1024 * 1024 * 1024): # Example: 2GB limit
+        if (message.video and message.video.file_size > (2 * 1024 * 1024 * 1024)) or \
+           (message.document and message.document.file_size > (2 * 1024 * 1024 * 1024)):
              await message.reply("⚠️ File is too large to be added to the bundle. Max limit is 2GB.", quote=True)
              return
              
+        # Add message ID to the list
         db.settings.update_one(
             {"_id": message.from_user.id, "type": "temp_link"},
             {"$push": {"message_ids": message.id}}
         )
         
         # Update file count in state for better user feedback
-        new_count = len(user_state.get("message_ids", [])) + 1
-        db.settings.update_one(
-            {"_id": message.from_user.id, "type": "temp_link"},
-            {"$set": {"current_count": new_count}}
-        )
+        new_state = db.settings.find_one({"_id": message.from_user.id, "type": "temp_link"})
+        new_count = len(new_state.get("message_ids", []))
         
         await message.reply(f"📦 File **#{new_count}** added to the bundle. Send more or use `/done` to finish.", quote=True)
         return
@@ -469,20 +461,22 @@ async def file_handler(client: Client, message: Message):
     status_msg = await message.reply("⏳ **Processing File...** Please wait while I create your link. 🔗", quote=True)
     
     try:
-        # Get original message details
         original_message = message
         
-        # 'forward' के बजाय 'copy' का उपयोग करें और thumbnail जोड़ें
-        # Pyrogram केवल Document, Video और Audio के लिए thumbnail_id को सपोर्ट करता है
+        # Determine thumbnail application: Pyrogram only supports 'thumb' for Document, Video, and Audio in copy_message
+        thumb_kwargs = {}
+        if thumbnail_id and (original_message.document or original_message.video or original_message.audio):
+             thumb_kwargs['thumb'] = thumbnail_id
+        
+        # Copy the message to the LOG_CHANNEL
         forwarded_message = await client.copy_message( 
             chat_id=LOG_CHANNEL, 
             from_chat_id=message.chat.id, 
             message_id=message.id,
             caption=original_message.caption,
             reply_markup=original_message.reply_markup,
-            # यदि यह एक Document, Video, या Audio है और थंबनेल सेट है, तो उसका उपयोग करें
-            **({'thumb': thumbnail_id} if thumbnail_id and (original_message.document or original_message.video or original_message.audio) else {}) 
-        ) # <--- यह ब्लॉक अपडेट करें
+            **thumb_kwargs
+        ) 
         
         file_id_str = await get_unique_id(db.files) 
         
@@ -620,7 +614,7 @@ async def multi_link_handler(client: Client, message: Message):
     )
     
     if thumbnail_id:
-         reply_text += "\n\n🖼️ **Note:** A custom thumbnail is currently set and will be applied to the files in this bundle."
+         reply_text += "\n\n🖼️ **Note:** A custom thumbnail is currently set and will be applied to the files in this bundle (if they are document/video/audio)."
     
     await message.reply(reply_text)
 
@@ -632,7 +626,7 @@ async def done_handler(client: Client, message: Message):
     
     if user_state and user_state.get("state") == "multi_link":
         message_ids = user_state.get("message_ids", [])
-        thumbnail_id = user_state.get("thumbnail_id") # <--- यह लाइन जोड़ें
+        thumbnail_id = user_state.get("thumbnail_id") 
         
         if not message_ids:
             await message.reply("❌ You haven't added any files. Please forward them first or use `/multi_link` again.")
@@ -647,17 +641,19 @@ async def done_handler(client: Client, message: Message):
                     # Get the original message to check file type and caption/markup
                     original_message = await client.get_messages(user_id, msg_id) 
                     
+                    thumb_kwargs = {}
+                    if thumbnail_id and (original_message.document or original_message.video or original_message.audio):
+                         thumb_kwargs['thumb'] = thumbnail_id
+                    
                     # Copy message from the user's chat to the LOG_CHANNEL
-                    # Pyrogram केवल Document, Video और Audio के लिए thumbnail_id को सपोर्ट करता है
                     forwarded_msg = await client.copy_message(
                         chat_id=LOG_CHANNEL, 
                         from_chat_id=user_id, 
                         message_id=msg_id,
                         caption=original_message.caption,
                         reply_markup=original_message.reply_markup,
-                        # यदि थंबनेल सेट है और यह Document, Video या Audio है, तो उसे लागू करें
-                        **({'thumb': thumbnail_id} if thumbnail_id and (original_message.document or original_message.video or original_message.audio) else {})
-                    ) # <--- यह ब्लॉक अपडेट करें
+                        **thumb_kwargs
+                    ) 
                     forwarded_msg_ids.append(forwarded_msg.id)
                     await asyncio.sleep(0.1) 
                 except Exception as e:
@@ -695,7 +691,7 @@ async def done_handler(client: Client, message: Message):
                  reply_text += f"\n\n🔒 **Access Condition:** User must join **@{force_channel}**."
             
             if thumbnail_id:
-                reply_text += "\n\n🖼️ **Custom thumbnail applied!**"
+                reply_text += "\n\n🖼️ **Custom thumbnail applied to compatible files!**"
                 
             await status_msg.edit_text(
                 reply_text,
@@ -827,8 +823,8 @@ async def stats_handler(client: Client, message: Message):
     today_multi_files = db.multi_files.count_documents({"created_at": {"$gte": today_start_dt}})
     
     # Advanced file type breakdown
-    file_types = db.files.aggregate([{"$group": {"_id": "$file_type", "count": {"$sum": 1}}}])
-    file_types_text = "\n".join([f"  • {ft['_id'].capitalize()}: **{ft['count']}**" for ft in file_types if ft['_id']])
+    file_types_cursor = db.files.aggregate([{"$group": {"_id": "$file_type", "count": {"$sum": 1}}}])
+    file_types_text = "\n".join([f"  • {ft['_id'].capitalize()}: **{ft['count']}**" for ft in file_types_cursor if ft['_id']])
     if not file_types_text:
         file_types_text = "  • No files recorded."
     
@@ -847,19 +843,32 @@ async def stats_handler(client: Client, message: Message):
     )
 
 @app.on_message(filters.command("broadcast") & filters.private & filters.user(ADMINS))
-async def broadcast_prompt_handler(client: Client, message: Message):
-    if len(message.command) < 2 and not message.reply_to_message:
+async def broadcast_handler_reply_enhanced(client: Client, message: Message):
+    
+    # Check for content: either a reply, or text after the command
+    if not message.reply_to_message and len(message.command) < 2:
         await message.reply(
             "📣 **Broadcast Mode**\n\n"
-            "Please send the message you want to broadcast immediately after the command, or reply to a message/media.\n"
-            "Example: `/broadcast Hello everyone! New files available!`\n\n"
+            "Please **reply** to the message/media you want to broadcast and use `/broadcast`.\n"
+            "Or, send the text immediately after the command: `/broadcast Hello everyone!`\n\n"
             "_Note: Formatting and media (replied to) are supported._"
         )
         return
 
-    # Use the entire message after the command as the broadcast content or the replied message's text/media
-    text_to_send = message.text.split(" ", 1)[1] if len(message.command) > 1 else None
+    # Determine content to send
+    broadcast_message = message.reply_to_message or message
     
+    if broadcast_message == message and len(message.command) > 1:
+        # It's a text broadcast via command argument
+        text_to_send = message.text.split(" ", 1)[1]
+    elif message.reply_to_message:
+        # It's a reply to a message/media
+        text_to_send = None # Handled by copy_message
+    else:
+        # Should not happen if the check above is correct, but for safety
+        await message.reply("Error: Could not determine broadcast content.")
+        return
+        
     # Get all user IDs
     users = db.users.find({}, {"_id": 1})
     user_ids = [user['_id'] for user in users]
@@ -870,81 +879,87 @@ async def broadcast_prompt_handler(client: Client, message: Message):
     status_msg = await message.reply(f"⏳ **Starting broadcast to {len(user_ids)} users...**")
     
     # Broadcast logic (better implementation with asyncio for speed)
-    async def send_message_task(chat_id, content, reply_to_msg):
+    async def send_message_task(chat_id, content_message, text_override):
         nonlocal success_count, failed_count
         try:
-            if reply_to_msg and reply_to_msg.media:
-                # If broadcast command is a reply to media, copy the media
-                await reply_to_msg.copy(chat_id)
-            elif content:
-                await client.send_message(chat_id=chat_id, text=content, disable_web_page_preview=True)
+            if text_override:
+                # Text broadcast via command argument
+                await client.send_message(chat_id=chat_id, text=text_override, disable_web_page_preview=True)
+            elif content_message:
+                # Media/Reply broadcast via copy
+                await content_message.copy(chat_id)
             success_count += 1
         except Exception:
+            # Assumed to be user blocked or left
             failed_count += 1
-        await asyncio.sleep(0.1) # Throttle
+            db.users.delete_one({"_id": chat_id}) # Optional: Clean up blocked users
+        await asyncio.sleep(0.1) # Throttle to prevent flooding
 
-    reply_to_msg = message.reply_to_message
-    tasks = [send_message_task(uid, text_to_send, reply_to_msg) for uid in user_ids]
+    tasks = []
+    for uid in user_ids:
+        if uid != message.from_user.id: # Don't send to self (admin)
+             tasks.append(send_message_task(uid, message.reply_to_message, text_to_send))
+             
     await asyncio.gather(*tasks)
     
     await status_msg.edit_text(
         f"✅ **Broadcast Complete!**\n\n"
         f"**Success:** `{success_count}`\n"
-        f"**Failed (Blocked/Left):** `{failed_count}`"
+        f"**Failed (Blocked/Left/Cleaned):** `{failed_count}`"
     )
 
-@app.on_message(filters.command("settings") & filters.private & filters.user(ADMINS))
-async def settings_handler(client: Client, message: Message):
-    # This just forwards to the admin panel with a settings view
-    await admin_panel_handler(client, message)
+# Note: /settings handler removed as it redirects to admin_panel_handler
 
 # --- Callback Query Handlers (Enhanced) ---
 
-@app.on_callback_query(filters.regex("^(about|help|start_menu|my_files_menu|admin_stats|admin_settings|admin_broadcast_prompt|admin)$"))
+@app.on_callback_query(filters.regex("^(about|help|start_menu|my_files_menu|admin_stats|admin_settings|admin_broadcast_prompt|admin|view_my_files|view_force_channels)$"))
 async def general_callback_handler(client: Client, callback_query: CallbackQuery):
     query = callback_query.data
     
+    # Defer logic for start, help, admin, stats, myfiles to main handlers for code consistency
     if query == "about":
         text = (
             "📚 **About FileLinker Bot**\n\n"
             "This bot creates **permanent, short, and shareable deep-links** for your Telegram files. "
             "It's built for efficiency, security, and a great user experience.\n\n"
-            "✨ **Core Features:** File-to-Link, Multi-File Bundling, Optional Force Join, Inline Search, and Admin Controls.\n\n"
+            "✨ **Core Features:** File-to-Link, Multi-File Bundling, Optional Force Join, Custom Thumbnails, Inline Search, and Admin Controls.\n\n"
             "Made with ❤️ by [ @narzoxbot ]."
         )
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("💡 How to Use?", callback_data="help"), InlineKeyboardButton("🔙 Back to Start", callback_data="start_menu")]])
-        await callback_query.message.edit_caption(text, reply_markup=keyboard) if callback_query.message.photo else await callback_query.message.edit_text(text, reply_markup=keyboard)
         
     elif query == "help":
-        # Simply defer to the /help handler logic
-        await callback_query.message.delete()
-        await help_handler_private(client, callback_query.message)
-        
+         await help_handler_private(client, callback_query.message)
+         await callback_query.answer()
+         return
+         
     elif query == "start_menu":
-        # Defer to the /start handler logic
-        await callback_query.message.delete()
-        await start_handler(client, callback_query.message)
-        
+         await start_handler(client, callback_query.message)
+         await callback_query.answer()
+         return
+         
+    elif query == "admin":
+         await admin_panel_handler(client, callback_query.message)
+         await callback_query.answer()
+         return
+         
+    elif query == "admin_stats":
+         await stats_handler(client, callback_query.message)
+         await callback_query.answer()
+         return
+         
     elif query == "my_files_menu":
         buttons = [
             [InlineKeyboardButton("📂 View My Last 10 Files", callback_data="view_my_files")],
             [InlineKeyboardButton("🔗 View Force Join Channels", callback_data="view_force_channels")],
             [InlineKeyboardButton("🔙 Back to Start", callback_data="start_menu")]
         ]
-        await callback_query.message.edit_caption(
-            "⚙️ **My Dashboard**\n\n"
-            "Manage your uploaded files and check the current force join channels.",
-            reply_markup=InlineKeyboardMarkup(buttons)
-        ) if callback_query.message.photo else await callback_query.message.edit_text(
-            "⚙️ **My Dashboard**\n\n"
-            "Manage your uploaded files and check the current force join channels.",
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
+        text = "⚙️ **My Dashboard**\n\nManage your uploaded files and check the current force join channels."
+        keyboard = InlineKeyboardMarkup(buttons)
         
     elif query == "view_my_files":
-         # Defer to the /myfiles handler logic
-         await callback_query.message.delete()
          await my_files_handler(client, callback_query.message)
+         await callback_query.answer()
+         return
          
     elif query == "view_force_channels":
         if FORCE_CHANNELS:
@@ -954,19 +969,8 @@ async def general_callback_handler(client: Client, callback_query: CallbackQuery
             text = "❌ **Global Force Join is NOT active!** No channels are required for general use."
             
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Menu", callback_data="my_files_menu")]])
-        await callback_query.message.edit_caption(text, reply_markup=keyboard) if callback_query.message.photo else await callback_query.message.edit_text(text, reply_markup=keyboard)
 
     # --- Admin Panel Callbacks ---
-    elif query == "admin":
-        # Defer to the /admin handler logic
-        await callback_query.message.delete()
-        await admin_panel_handler(client, callback_query.message)
-        
-    elif query == "admin_stats":
-         # Defer to the /stats handler logic
-         await callback_query.message.delete()
-         await stats_handler(client, callback_query.message)
-         
     elif query == "admin_settings":
         current_mode = await get_bot_mode(db)
         
@@ -974,24 +978,33 @@ async def general_callback_handler(client: Client, callback_query: CallbackQuery
         private_button = InlineKeyboardButton("🔒 Private (Admins Only)", callback_data="set_mode_private")
         keyboard = InlineKeyboardMarkup([[public_button], [private_button], [InlineKeyboardButton("🔙 Back to Admin", callback_data="admin")]])
         
-        await callback_query.message.edit_text(
+        text = (
             f"⚙️ **Bot File Upload Mode**\n\n"
             f"The current mode is **{current_mode.upper()}**.\n"
-            f"Select a new mode below:",
-            reply_markup=keyboard
+            f"Select a new mode below:"
         )
 
     elif query == "admin_broadcast_prompt":
-        await callback_query.message.edit_text(
+        text = (
             "📣 **Broadcast Message**\n\n"
-            "Please send the broadcast message immediately after the `/broadcast` command.\n"
-            "Example: `/broadcast Check out our new bot features! #update`\n\n"
-            "_You can also reply to a photo/video with `/broadcast` to send media._",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin", callback_data="admin")]])
+            "Please **reply** to the message/media you want to broadcast and use `/broadcast`.\n"
+            "Example: `/broadcast Check out our new bot features! #update`"
         )
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin", callback_data="admin")]])
 
+    # Edit message based on where it came from (caption or text)
+    try:
+        if callback_query.message.photo:
+            await callback_query.message.edit_caption(text, reply_markup=keyboard, disable_web_page_preview=True)
+        else:
+            await callback_query.message.edit_text(text, reply_markup=keyboard, disable_web_page_preview=True)
+    except Exception:
+         # Handle case where original message was deleted or is too old
+         await callback_query.message.delete()
+         await callback_query.message.reply(text, reply_markup=keyboard, disable_web_page_preview=True)
+        
     await callback_query.answer()
-
+    
 @app.on_callback_query(filters.regex(r"^check_join_"))
 async def check_join_callback(client: Client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
@@ -1016,7 +1029,10 @@ async def check_join_callback(client: Client, callback_query: CallbackQuery):
 
     if not missing_channels:
         await callback_query.answer("Thanks for joining! Sending files now... 🥳", show_alert=True)
-        await callback_query.message.delete()
+        try:
+             await callback_query.message.delete()
+        except Exception:
+             pass # Ignore if already deleted
         
         if file_id_str and file_id_str != 'force':
              # Simulate a successful /start command to deliver the file
@@ -1025,7 +1041,7 @@ async def check_join_callback(client: Client, callback_query: CallbackQuery):
              fake_message.command = ["start", file_id_str]
              await start_handler(client, fake_message)
         else:
-             await callback_query.message.reply("✅ You are a member of all required channels now!")
+             await callback_query.message.reply("✅ You are a member of all required channels now! Please try the feature again.")
 
     else:
         await callback_query.answer("You have not joined all the channels. Please join them and try again.", show_alert=True)
@@ -1080,7 +1096,10 @@ async def confirm_delete_callback(client: Client, callback_query: CallbackQuery)
 
     if not record_to_delete:
         await callback_query.answer("File/Bundle not found or already deleted.", show_alert=True)
-        await callback_query.message.edit_text("❌ Item could not be deleted. It might be a bad link or already gone.")
+        try:
+             await callback_query.message.edit_text("❌ Item could not be deleted. It might be a bad link or already gone.")
+        except Exception:
+             pass
         return
 
     try:
@@ -1204,55 +1223,31 @@ async def inline_search(client, inline_query):
     )
 
 
-# --- Group Features (Enhanced with Pyrogram types) ---
+# --- Group Features (Enhanced Moderation Only) ---
 
-@app.on_chat_member_updated(filters.group)
-async def welcome_and_goodbye_messages(client: Client, member: Message):
-    """Handles new user joins and users leaving for logging."""
-    if not GROUP_LOG_CHANNEL: return
+# Note: welcome_and_goodbye_messages (on_chat_member_updated) is removed as it was not explicitly requested
+# The anti-link and anti-badword logic is moved to a general message handler for groups.
 
-    user = member.new_chat_member.user if member.new_chat_member and member.new_chat_member.user else member.old_chat_member.user
+@app.on_message(filters.group & ~filters.edited & ~filters.service)
+async def group_message_moderation(client: Client, message: Message):
+    """Applies anti-link and anti-badword filtering in groups."""
     
-    if user.is_bot: return
-
-    # User joined
-    if member.new_chat_member and member.new_chat_member.status != 'left' and member.old_chat_member and member.old_chat_member.status == 'left':
-        # New member joined from a left status
-        log_text = (
-            f"👥 **New Member Joined!**\n"
-            f"• **Name:** {await get_user_full_name(user)}\n"
-            f"• **ID:** `{user.id}`\n"
-            f"• **Username:** @{user.username if user.username else 'N/A'}\n"
-            f"• **Group:** {member.chat.title} (`{member.chat.id}`)"
-        )
-        await client.send_message(GROUP_LOG_CHANNEL, log_text)
-
-    # User left/was kicked/banned
-    elif member.old_chat_member and member.old_chat_member.status != 'left' and member.new_chat_member and member.new_chat_member.status in ['left', 'banned', 'kicked']:
-        
-        action = "Kicked/Banned" if member.new_chat_member.status in ['banned', 'kicked'] else "Left"
-        log_text = (
-            f"🚪 **Member {action}!**\n"
-            f"• **Name:** {await get_user_full_name(user)}\n"
-            f"• **ID:** `{user.id}`\n"
-            f"• **Group:** {member.chat.title} (`{member.chat.id}`)"
-        )
-        await client.send_message(GROUP_LOG_CHANNEL, log_text)
-
-
-
-    # Anti-Link Filter
+    if message.from_user.is_bot or message.from_user.id in ADMINS:
+         return # Ignore messages from bots or admins
+         
     text_with_caption = message.text or message.caption
-    entities = message.entities if message.entities else message.caption_entities
     
-    if entities:
+    # 1. Anti-Link Filter
+    if message.entities or message.caption_entities:
+        entities = message.entities if message.entities else message.caption_entities
+        
         for entity in entities:
             # Check for URL, text_link, or bot mention/command which can sometimes be abused
-            if entity.type in ["url", "text_link"] and not filters.user(ADMINS)(client, message):
+            if entity.type in ["url", "text_link", "text_mention"]: # Added text_mention as it can hide links
                 try:
                     await message.delete()
                     await message.reply(
-                        f"🚫 **Link Removed!** {await get_user_full_name(message.from_user)}, links are not allowed here.",
+                        f"🚫 **Link Removed!** {await get_user_full_name(message.from_user)}, unauthorized links are not allowed here.",
                         quote=True
                     )
                     
@@ -1260,31 +1255,55 @@ async def welcome_and_goodbye_messages(client: Client, member: Message):
                         f"🔗 **Link Removed!**\n"
                         f"• **User:** {await get_user_full_name(message.from_user)} (`{message.from_user.id}`)\n"
                         f"• **Group:** {message.chat.title} (`{message.chat.id}`)\n"
-                        f"• **Message:** `{'Link detected'}`"
+                        f"• **Entity Type:** `{entity.type}`"
                     )
                     if GROUP_LOG_CHANNEL: await client.send_message(GROUP_LOG_CHANNEL, log_text)
                     return
                 except ChatAdminRequired:
                     return
 
-    # Anti-Badwords Filter
+    # 2. Anti-Badwords Filter
     text_lower = (text_with_caption or "").lower()
     for badword in BADWORDS:
         if badword and badword in text_lower:
             try:
                 await message.delete()
-                await message.reply(f"🤬 **Censored!** Please mind your language, {await get_user_full_name(message.from_user)}.", quote=True)
+                # Store a warning before replying
+                warnings_record = db.warnings.find_one({"user_id": message.from_user.id, "chat_id": message.chat.id})
+                new_warnings = warnings_record['warnings'] + 1 if warnings_record else 1
+                db.warnings.update_one(
+                     {"user_id": message.from_user.id, "chat_id": message.chat.id}, 
+                     {"$set": {"warnings": new_warnings, "last_warned": datetime.utcnow()}}, 
+                     upsert=True
+                )
+                
+                reply_message = f"🤬 **Censored!** Please mind your language, {await get_user_full_name(message.from_user)}. **({new_warnings}/{MAX_WARNINGS} Warnings)**"
+                
+                await message.reply(reply_message, quote=True)
                 
                 log_text = (
                     f"🤬 **Badword Removed!**\n"
                     f"• **User:** {await get_user_full_name(message.from_user)} (`{message.from_user.id}`)\n"
                     f"• **Group:** {message.chat.title} (`{message.chat.id}`)\n"
-                    f"• **Text:** `{text_with_caption}`"
+                    f"• **Warns:** `{new_warnings}` / `{MAX_WARNINGS}`"
                 )
                 if GROUP_LOG_CHANNEL: await client.send_message(GROUP_LOG_CHANNEL, log_text)
+
+                if new_warnings >= MAX_WARNINGS:
+                     # Auto-Mute Logic
+                    await client.restrict_chat_member(
+                        message.chat.id, 
+                        message.from_user.id, 
+                        permissions=ChatPermissions(can_send_messages=False), 
+                        until_date=datetime.now() + timedelta(hours=24) # Mute for 24h
+                    )
+                    db.warnings.delete_one({"user_id": message.from_user.id, "chat_id": message.chat.id})
+                    await message.reply(f"🚫 {await get_user_full_name(message.from_user)} reached max warnings and has been **muted for 24 hours**.")
+
                 return
             except ChatAdminRequired:
                 return
+
 
 @app.on_message(filters.command("warn") & filters.group & filters.user(ADMINS))
 async def warn_user(client: Client, message: Message):
@@ -1302,13 +1321,13 @@ async def warn_user(client: Client, message: Message):
     warnings_record = db.warnings.find_one({"user_id": target_user.id, "chat_id": chat_id})
     if warnings_record:
         new_warnings = warnings_record['warnings'] + 1
-        db.warnings.update_one({"user_id": target_user.id, "chat_id": chat_id}, {"$set": {"warnings": new_warnings}})
+        db.warnings.update_one({"user_id": target_user.id, "chat_id": chat_id}, {"$set": {"warnings": new_warnings, "last_warned": datetime.utcnow()}})
     else:
         new_warnings = 1
-        db.warnings.insert_one({"user_id": target_user.id, "chat_id": chat_id, "warnings": new_warnings})
+        db.warnings.insert_one({"user_id": target_user.id, "chat_id": chat_id, "warnings": new_warnings, "last_warned": datetime.utcnow()})
     
     await message.reply(
-        f"⚠️ {await get_user_full_name(target_user)} has been warned. "
+        f"⚠️ {await get_user_full_name(target_user)} has been warned by Admin. "
         f"Warnings: **{new_warnings}/{MAX_WARNINGS}**."
     )
     
@@ -1359,8 +1378,12 @@ async def temp_mute(client: Client, message: Message):
         return
         
     try:
-        duration_str = message.command[1]
-        duration_unit = duration_str[-1].lower()
+        if len(message.command) < 2:
+            duration_str = "1h" # Default mute duration
+        else:
+            duration_str = message.command[1].lower()
+            
+        duration_unit = duration_str[-1]
         duration_value = int(duration_str[:-1])
 
         if duration_unit == "m":
@@ -1394,9 +1417,49 @@ async def temp_mute(client: Client, message: Message):
         if GROUP_LOG_CHANNEL: await client.send_message(GROUP_LOG_CHANNEL, log_text)
 
     except (IndexError, ValueError):
-        await message.reply("Please provide a duration. Example: `/mute 30m`.")
+        await message.reply("Please provide a valid duration. Example: `/mute 30m`.")
     except ChatAdminRequired:
         await message.reply("I need admin rights with 'Restrict users' permission to mute this user.")
+
+@app.on_message(filters.command("unmute") & filters.group & filters.user(ADMINS))
+async def unmute_user(client: Client, message: Message):
+    if not message.reply_to_message:
+        await message.reply("🔊 Please reply to a user's message to unmute them.")
+        return
+
+    target_user = message.reply_to_message.from_user
+    chat_id = message.chat.id
+    
+    if target_user.is_bot or target_user.id in ADMINS:
+        await message.reply("Cannot unmute a bot or an admin.")
+        return
+        
+    try:
+        # Unmute (set all permissions back)
+        await client.restrict_chat_member(
+            chat_id, 
+            target_user.id, 
+            permissions=ChatPermissions(
+                can_send_messages=True,
+                can_send_media_messages=True,
+                can_send_other_messages=True,
+                can_add_web_page_previews=True,
+                can_send_polls=True
+            ),
+            until_date=datetime.now() # Unmute immediately
+        )
+        await message.reply(f"🔊 {await get_user_full_name(target_user)} has been **unmuted**.")
+        
+        log_text = (
+            f"🔊 **User Unmuted!**\n"
+            f"• **User:** {await get_user_full_name(target_user)} (`{target_user.id}`)\n"
+            f"• **Admin:** {await get_user_full_name(message.from_user)}\n"
+            f"• **Group:** {message.chat.title}"
+        )
+        if GROUP_LOG_CHANNEL: await client.send_message(GROUP_LOG_CHANNEL, log_text)
+
+    except ChatAdminRequired:
+        await message.reply("I need admin rights with 'Restrict users' permission to unmute this user.")
 
 @app.on_message(filters.command("kick") & filters.group & filters.user(ADMINS))
 async def temp_kick(client: Client, message: Message):
