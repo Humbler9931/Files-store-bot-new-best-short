@@ -57,7 +57,7 @@ try:
     
     FORCE_CHANNELS = [channel.strip() for channel in os.environ.get("FORCE_CHANNELS", "").split(',') if channel.strip()]
     
-    BADWORDS = [word.strip() for word in os.environ.get("BADWORDS", "fuck,bitch,asshole,randi,madarchod").lower().split(',') if word.strip()]
+    BADWORDS = [word.strip() for word in os.environ.get("BADWORDS", "bsdk,bc,mc,laura,land,bur,Madharchod,kamina,kutta,fuck,bitch,asshole,randi,madarchod").lower().split(',') if word.strip()]
     MAX_WARNINGS = int(os.environ.get("MAX_WARNINGS", 3))
     
 except (ValueError, TypeError) as e:
